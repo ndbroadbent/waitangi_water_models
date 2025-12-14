@@ -133,22 +133,53 @@ def create_manning_field(z_bed: np.ndarray, mangrove_mask: np.ndarray) -> np.nda
     return manning
 
 
-def create_dual_tracer_colormap():
-    """Create colormap for dual tracer visualization.
+def blend_tracer_colors(river_tracer: np.ndarray, ocean_tracer: np.ndarray) -> np.ndarray:
+    """Blend colors based on dual tracer concentrations.
 
-    Tracer values:
-    - 0.0 = pure ocean (pink)
-    - 0.5 = neutral/untainted water (blue)
-    - 1.0 = pure river (green)
+    Color scheme:
+    - Yellow (1,1,0) = river water
+    - Red (1,0,0) = ocean water
+    - Orange (1,0.5,0) = mixed river+ocean
+    - Blue (0.2,0.5,0.9) = neutral/untainted water
+
+    Args:
+        river_tracer: River tracer concentration (0-1)
+        ocean_tracer: Ocean tracer concentration (0-1)
+
+    Returns:
+        RGBA array shape (ny, nx, 4)
     """
-    colors = [
-        (0.0, (0.9, 0.2, 0.6, 0.9)),   # Bright pink (pure ocean)
-        (0.25, (0.7, 0.4, 0.8, 0.85)), # Light pink-purple
-        (0.5, (0.2, 0.5, 0.9, 0.85)),  # Blue (neutral/untainted)
-        (0.75, (0.4, 0.8, 0.4, 0.85)), # Light green
-        (1.0, (0.1, 0.95, 0.1, 0.9)),  # Bright green (pure river)
-    ]
-    return LinearSegmentedColormap.from_list("ocean_river", colors)
+    ny, nx = river_tracer.shape
+    rgba = np.zeros((ny, nx, 4))
+
+    # Base color is blue for neutral water
+    blue = np.array([0.2, 0.5, 0.9])
+    yellow = np.array([1.0, 0.95, 0.0])
+    red = np.array([1.0, 0.1, 0.1])
+
+    # Calculate total tracer influence
+    total = river_tracer + ocean_tracer
+    total_safe = np.maximum(total, 1e-6)
+
+    # Blend between yellow (river) and red (ocean) based on relative proportions
+    # When both are present, we get orange
+    river_fraction = river_tracer / total_safe
+    ocean_fraction = ocean_tracer / total_safe
+
+    # Tracer color is weighted blend of yellow and red
+    tracer_color = (
+        river_fraction[:, :, np.newaxis] * yellow +
+        ocean_fraction[:, :, np.newaxis] * red
+    )
+
+    # Blend between blue (neutral) and tracer color based on total concentration
+    # Clamp total to 1.0 for blending
+    blend_factor = np.minimum(total, 1.0)[:, :, np.newaxis]
+
+    rgba[:, :, :3] = (1 - blend_factor) * blue + blend_factor * tracer_color
+    rgba[:, :, 3] = 0.85  # Alpha
+
+    return rgba
 
 
 def velocity_to_compass(u: float, v: float) -> str:
@@ -172,20 +203,75 @@ def velocity_to_compass(u: float, v: float) -> str:
 
 
 @jit
-def simulation_step(eta, u, v, tracer, z_bed, manning_field, params, tracer_diffusion: float = 5.0):
+def advect_tracer(tracer, h, h_new, u, v, h_e, h_n, dx, dy, dt, tracer_diffusion):
+    """Advect and diffuse a single tracer field.
+
+    Args:
+        tracer: Tracer concentration (0-1)
+        h: Current water depth
+        h_new: New water depth after eta update
+        u, v: Velocity components
+        h_e, h_n: Upwind depths at cell faces
+        dx, dy, dt: Grid spacing and timestep
+        tracer_diffusion: Diffusion coefficient
+
+    Returns:
+        Updated tracer field
+    """
+    # Upwind tracer values at cell faces
+    tracer_e = jnp.where(u[:-1, :] > 0, tracer[:-1, :], tracer[1:, :])
+    tracer_n = jnp.where(v[:, :-1] > 0, tracer[:, :-1], tracer[:, 1:])
+
+    # Tracer flux
+    tracer_flux_e = u[:-1, :] * h_e * tracer_e
+    tracer_flux_n = v[:, :-1] * h_n * tracer_n
+
+    # Divergence of tracer flux
+    tracer_div = jnp.zeros_like(tracer)
+    tracer_div = tracer_div.at[:-1, :].add(tracer_flux_e / dx)
+    tracer_div = tracer_div.at[1:, :].add(-tracer_flux_e / dx)
+    tracer_div = tracer_div.at[:, :-1].add(tracer_flux_n / dy)
+    tracer_div = tracer_div.at[:, 1:].add(-tracer_flux_n / dy)
+
+    h_safe = jnp.maximum(h_new, 0.01)
+    wet_new = h_new > 0.01
+
+    # Dry cells have zero tracer (they have no water to carry tracer)
+    tracer = jnp.where(wet_new, (tracer * h - dt * tracer_div) / h_safe, 0.0)
+    tracer = jnp.clip(tracer, 0.0, 1.0)
+
+    # Tracer diffusion (optional - set to 0 for permanent dye tracking)
+    # Pad with 0 to prevent boundary artifacts
+    tracer_padded = jnp.pad(tracer, 1, mode='constant', constant_values=0.0)
+    lap = (
+        tracer_padded[:-2, 1:-1] + tracer_padded[2:, 1:-1] +
+        tracer_padded[1:-1, :-2] + tracer_padded[1:-1, 2:] - 4 * tracer
+    ) / (dx * dy)
+    tracer = tracer + tracer_diffusion * dt * lap
+    tracer = jnp.clip(tracer, 0.0, 1.0)
+
+    # Ensure dry cells stay at zero
+    tracer = jnp.where(wet_new, tracer, 0.0)
+
+    return tracer
+
+
+@jit
+def simulation_step(eta, u, v, river_tracer, ocean_tracer, z_bed, manning_field, params, tracer_diffusion: float = 5.0):
     """Single simulation timestep - JIT compiled for GPU.
 
     Args:
         eta: Water surface elevation
         u, v: Velocity components
-        tracer: River tracer concentration (0=ocean, 1=river)
+        river_tracer: River tracer concentration (0=none, 1=pure river)
+        ocean_tracer: Ocean tracer concentration (0=none, 1=pure ocean)
         z_bed: Bed elevation
         manning_field: Spatially-varying Manning's n coefficient
         params: (dx, dy, dt, g, max_vel)
-        tracer_diffusion: Diffusion coefficient for tracer (0 = no diffusion, permanent dye)
+        tracer_diffusion: Diffusion coefficient for tracers (0 = no diffusion)
 
     Returns:
-        Updated eta, u, v, tracer
+        Updated eta, u, v, river_tracer, ocean_tracer
     """
     dx, dy, dt, g, max_vel = params
 
@@ -249,40 +335,13 @@ def simulation_step(eta, u, v, tracer, z_bed, manning_field, params, tracer_diff
     eta = eta - dt * div
     eta = jnp.maximum(eta, z_bed)
 
-    # Tracer advection (upwind)
+    # Advect both tracers
     h_new = jnp.maximum(eta - z_bed, 0.0)
 
-    tracer_e = jnp.where(u[:-1, :] > 0, tracer[:-1, :], tracer[1:, :])
-    tracer_n = jnp.where(v[:, :-1] > 0, tracer[:, :-1], tracer[:, 1:])
+    river_tracer = advect_tracer(river_tracer, h, h_new, u, v, h_e, h_n, dx, dy, dt, tracer_diffusion)
+    ocean_tracer = advect_tracer(ocean_tracer, h, h_new, u, v, h_e, h_n, dx, dy, dt, tracer_diffusion)
 
-    tracer_flux_e = u[:-1, :] * h_e * tracer_e
-    tracer_flux_n = v[:, :-1] * h_n * tracer_n
-
-    tracer_div = jnp.zeros_like(tracer)
-    tracer_div = tracer_div.at[:-1, :].add(tracer_flux_e / dx)
-    tracer_div = tracer_div.at[1:, :].add(-tracer_flux_e / dx)
-    tracer_div = tracer_div.at[:, :-1].add(tracer_flux_n / dy)
-    tracer_div = tracer_div.at[:, 1:].add(-tracer_flux_n / dy)
-
-    h_safe = jnp.maximum(h_new, 0.01)
-    wet_new = h_new > 0.01
-    # Dry cells keep neutral value (0.5) - prevents pink leaking from boundaries
-    tracer = jnp.where(wet_new, (tracer * h - dt * tracer_div) / h_safe, 0.5)
-    tracer = jnp.clip(tracer, 0.0, 1.0)
-
-    # Tracer diffusion (optional - set to 0 for permanent dye tracking)
-    # Pad with 0.5 (neutral) to prevent boundary artifacts
-    tracer_padded = jnp.pad(tracer, 1, mode='constant', constant_values=0.5)
-    lap = (
-        tracer_padded[:-2, 1:-1] + tracer_padded[2:, 1:-1] +
-        tracer_padded[1:-1, :-2] + tracer_padded[1:-1, 2:] - 4 * tracer
-    ) / (dx * dy)
-    tracer = tracer + tracer_diffusion * dt * lap
-    tracer = jnp.clip(tracer, 0.0, 1.0)
-    # Ensure dry cells stay neutral
-    tracer = jnp.where(wet_new, tracer, 0.5)
-
-    return eta, u, v, tracer
+    return eta, u, v, river_tracer, ocean_tracer
 
 
 @jit
@@ -306,14 +365,14 @@ def apply_boundary_conditions_hydro(eta, u, v, z_bed, dam_mask, dam_level,
 
 
 @jit
-def apply_boundary_conditions_full(eta, u, v, tracer, z_bed, dam_mask, dam_level,
+def apply_boundary_conditions_full(eta, u, v, river_tracer, ocean_tracer, z_bed, dam_mask, dam_level,
                                     river_mask, river_level, river_dh,
                                     ocean_inlet_mask):
-    """Apply full boundary conditions including tracer injection.
+    """Apply full boundary conditions including dual tracer injection.
 
     Dam acts as spillway (controls water level across entire wall).
-    Ocean tracer injected only at ocean_inlet_mask (small section).
-    River source adds water + injects river tracer (1).
+    Ocean tracer injected at ocean_inlet_mask.
+    River tracer injected at river source.
     """
     # Dam spillway: clamp water level to dam height
     eta = jnp.where(dam_mask, dam_level, eta)
@@ -322,13 +381,13 @@ def apply_boundary_conditions_full(eta, u, v, tracer, z_bed, dam_mask, dam_level
     eta = jnp.where(river_mask, eta + river_dh, eta)
     eta = jnp.where(river_mask, jnp.maximum(eta, river_level), eta)
 
-    # Tracer sources - use ocean_inlet_mask for tracer (not entire dam_mask)
+    # Inject tracers at their respective sources
     h = jnp.maximum(eta - z_bed, 0.0)
     wet = h > 0.01
-    tracer = jnp.where(river_mask & wet, 1.0, tracer)        # River = green
-    tracer = jnp.where(ocean_inlet_mask & wet, 0.0, tracer)  # Ocean inlet = pink
+    river_tracer = jnp.where(river_mask & wet, 1.0, river_tracer)       # River source = yellow
+    ocean_tracer = jnp.where(ocean_inlet_mask & wet, 1.0, ocean_tracer) # Ocean inlet = red
 
-    return eta, u, v, tracer
+    return eta, u, v, river_tracer, ocean_tracer
 
 
 def run_equilibrium_test():
@@ -387,7 +446,7 @@ def run_equilibrium_test():
     z_bed = jnp.array(z_bed_np)
     dam_mask = jnp.array(dam_mask_np)
     river_mask = jnp.array(river_mask_np)
-    params = (dx, dy, dt, g, manning_n, max_vel)
+    params = (dx, dy, dt, g, max_vel)
 
     # River inflow per timestep (disabled for equilibrium test)
     river_area = np.sum(river_mask_np) * dx * dy
@@ -401,7 +460,8 @@ def run_equilibrium_test():
     eta = jnp.array(eta_np)
     u = jnp.zeros((ny, nx))
     v = jnp.zeros((ny, nx))
-    tracer = jnp.zeros((ny, nx))
+    river_tracer = jnp.zeros((ny, nx))
+    ocean_tracer = jnp.zeros((ny, nx))
 
     # Initial state
     h_init = np.maximum(eta_np - z_bed_np, 0)
@@ -410,12 +470,18 @@ def run_equilibrium_test():
     log(f"Initial wet area: {init_area:.2f} km²")
     log(f"Initial volume: {init_volume:.3f} million m³")
 
+    # Create a manning field (uniform for test)
+    manning_field = jnp.full((ny, nx), manning_n)
+
     # Warm up JIT
     log("\nWarming up JIT compilation...")
     start = time.time()
-    eta, u, v, tracer = simulation_step(eta, u, v, tracer, z_bed, params)
-    eta, u, v, tracer = apply_boundary_conditions_full(
-        eta, u, v, tracer, z_bed, dam_mask, high_tide,
+    eta, u, v, river_tracer, ocean_tracer = simulation_step(
+        eta, u, v, river_tracer, ocean_tracer, z_bed, manning_field, params
+    )
+    # Use hydro-only boundary conditions for equilibrium test
+    eta, u, v = apply_boundary_conditions_hydro(
+        eta, u, v, z_bed, dam_mask, high_tide,
         river_mask, high_tide + 1.0, river_dh
     )
     jax.block_until_ready(eta)
@@ -429,9 +495,11 @@ def run_equilibrium_test():
     start = time.time()
 
     for step in range(n_steps):
-        eta, u, v, tracer = simulation_step(eta, u, v, tracer, z_bed, params)
-        eta, u, v, tracer = apply_boundary_conditions_full(
-            eta, u, v, tracer, z_bed, dam_mask, high_tide,
+        eta, u, v, river_tracer, ocean_tracer = simulation_step(
+            eta, u, v, river_tracer, ocean_tracer, z_bed, manning_field, params
+        )
+        eta, u, v = apply_boundary_conditions_hydro(
+            eta, u, v, z_bed, dam_mask, high_tide,
             river_mask, high_tide + 1.0, river_dh
         )
 
@@ -517,12 +585,19 @@ def run_tidal_cycle(river_flow: float = 1.0, tracer_diffusion: float = 0.5, dura
     - Rising tide: wall rises, water flows in from "ocean"
     - Falling tide: wall lowers, water spills over and leaves simulation
 
+    Frames are streamed directly to ffmpeg - no intermediate files.
+
     Args:
         river_flow: River discharge in m³/s (default 1.0, use 15.0 for heavy rain)
         tracer_diffusion: Diffusion coefficient for tracer (default 5.0, use 0 for permanent dye)
+        duration_hours: Simulation duration (default: full tidal cycle ~12.4h)
     """
+    import io
+    import contextily as ctx
+    from scipy.ndimage import zoom as scipy_zoom
+
     log("=" * 60)
-    log("JAX Tidal Cycle Simulation")
+    log("JAX Tidal Cycle Simulation (streaming to ffmpeg)")
     log("=" * 60)
     log(f"River flow: {river_flow} m³/s" + (" (HEAVY RAINFALL)" if river_flow > 5 else ""))
     log(f"Tracer diffusion: {tracer_diffusion}" + (" (PERMANENT DYE)" if tracer_diffusion == 0 else ""))
@@ -634,30 +709,35 @@ def run_tidal_cycle(river_flow: float = 1.0, tracer_diffusion: float = 0.5, dura
     eta = jnp.array(eta_np)
     u = jnp.zeros((ny, nx))
     v = jnp.zeros((ny, nx))
-    # Tracer: 0=ocean(pink), 0.5=neutral(blue), 1=river(green)
-    # Start with neutral blue water everywhere
-    tracer = jnp.full((ny, nx), 0.5)
+    # Dual tracers: both start at zero (neutral blue water)
+    river_tracer = jnp.zeros((ny, nx))
+    ocean_tracer = jnp.zeros((ny, nx))
 
     # Warm up JIT (no tracer injection during warmup)
     log("Warming up JIT...")
-    eta, u, v, tracer = simulation_step(eta, u, v, tracer, z_bed, manning_field, params, tracer_diffusion)
+    eta, u, v, river_tracer, ocean_tracer = simulation_step(
+        eta, u, v, river_tracer, ocean_tracer, z_bed, manning_field, params, tracer_diffusion
+    )
     eta, u, v = apply_boundary_conditions_hydro(
         eta, u, v, z_bed, wall_mask, low_tide,
         river_mask, low_tide + 1.0, river_dh
     )
     jax.block_until_ready(eta)
 
-    # Quick equilibration at low tide (NO tracer injection - keep water neutral blue)
+    # Quick equilibration at low tide (NO tracer injection - keep water neutral)
     log("Equilibrating at low tide (no tracer injection)...")
     for _ in range(2000):
-        eta, u, v, tracer = simulation_step(eta, u, v, tracer, z_bed, manning_field, params, tracer_diffusion)
+        eta, u, v, river_tracer, ocean_tracer = simulation_step(
+            eta, u, v, river_tracer, ocean_tracer, z_bed, manning_field, params, tracer_diffusion
+        )
         eta, u, v = apply_boundary_conditions_hydro(
             eta, u, v, z_bed, wall_mask, low_tide,
             river_mask, low_tide + 1.0, river_dh
         )
 
-    # Reset tracer to neutral after equilibration
-    tracer = jnp.full((ny, nx), 0.5)
+    # Reset tracers to zero after equilibration (neutral blue water)
+    river_tracer = jnp.zeros((ny, nx))
+    ocean_tracer = jnp.zeros((ny, nx))
 
     # Simulation parameters
     if duration_hours is not None:
@@ -670,13 +750,52 @@ def run_tidal_cycle(river_flow: float = 1.0, tracer_diffusion: float = 0.5, dura
 
     log(f"\nRunning tidal cycle...")
     log(f"Duration: {duration/3600:.1f} hours ({n_steps} steps)")
-    log(f"Output every {output_interval}s ({n_steps // steps_per_output} frames)")
+    n_frames = n_steps // steps_per_output + 1
+    log(f"Output every {output_interval}s ({n_frames} frames)")
 
-    # Storage
-    frames = []
-    frame_times = []
+    # Prepare rendering
+    extent = [elev.bounds[0], elev.bounds[2], elev.bounds[1], elev.bounds[3]]
+
+    # Pre-fetch basemap once (it's the same for all frames)
+    log("Fetching basemap...")
+    fig_test, ax_test = plt.subplots(figsize=(14, 10))
+    ax_test.set_xlim(extent[0], extent[1])
+    ax_test.set_ylim(extent[2], extent[3])
+    basemap_failed = False
+    try:
+        ctx.add_basemap(ax_test, crs="EPSG:2193", source=ctx.providers.Esri.WorldImagery, zoom=15)
+    except Exception as e:
+        log(f"  Warning: basemap failed: {e}")
+        basemap_failed = True
+    plt.close(fig_test)
+
+    # Start ffmpeg process - stream PNG frames via stdin
+    video_path = "tidal_cycle.mp4"
+    log(f"\nStarting ffmpeg (streaming to {video_path})...")
+    try:
+        ffmpeg_proc = subprocess.Popen([
+            "ffmpeg", "-y",
+            "-f", "image2pipe",
+            "-framerate", "10",
+            "-i", "-",
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+            "-crf", "18",
+            video_path,
+        ], stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        ffmpeg_available = True
+    except FileNotFoundError:
+        log("  Warning: ffmpeg not found - will save frames to disk instead")
+        ffmpeg_available = False
+        ffmpeg_proc = None
+        output_dir = Path("tidal_cycle_frames")
+        output_dir.mkdir(exist_ok=True)
+        for old in output_dir.glob("frame_*.png"):
+            old.unlink()
 
     start_time = time.time()
+    frame_count = 0
 
     for step in range(n_steps):
         t = step * dt
@@ -685,24 +804,26 @@ def run_tidal_cycle(river_flow: float = 1.0, tracer_diffusion: float = 0.5, dura
         tide_level = mean_tide + tide_amplitude * np.sin(2 * np.pi * t / tide_period - np.pi/2)
 
         # Simulation step with spatially-varying friction
-        eta, u, v, tracer = simulation_step(eta, u, v, tracer, z_bed, manning_field, params, tracer_diffusion)
+        eta, u, v, river_tracer, ocean_tracer = simulation_step(
+            eta, u, v, river_tracer, ocean_tracer, z_bed, manning_field, params, tracer_diffusion
+        )
 
         # Apply boundary: wall cells are clamped to tide level
-        # This is how water flows in (rising) or out (falling)
-        # Use full version to inject tracers during main simulation
-        eta, u, v, tracer = apply_boundary_conditions_full(
-            eta, u, v, tracer, z_bed, wall_mask, tide_level,
+        eta, u, v, river_tracer, ocean_tracer = apply_boundary_conditions_full(
+            eta, u, v, river_tracer, ocean_tracer, z_bed, wall_mask, tide_level,
             river_mask, tide_level + 1.0, river_dh,
             ocean_inlet_mask
         )
 
-        # Save frame
+        # Render and stream frame
         if step % steps_per_output == 0:
             jax.block_until_ready(eta)
             eta_np = np.array(eta)
             u_np = np.array(u)
             v_np = np.array(v)
             h = np.maximum(eta_np - z_bed_np, 0)
+            river_tracer_np = np.array(river_tracer)
+            ocean_tracer_np = np.array(ocean_tracer)
 
             # Collect gauge measurements
             gauge_data = []
@@ -712,8 +833,7 @@ def run_tidal_cycle(river_flow: float = 1.0, tracer_diffusion: float = 0.5, dura
                 gu = u_np[r, c]
                 gv = v_np[r, c]
                 speed = np.sqrt(gu**2 + gv**2)
-                # Flow rate Q = velocity * depth * width (estimate width as dx)
-                flow = speed * gh * dx  # m³/s (approximate, assumes flow perpendicular to cell)
+                flow = speed * gh * dx
                 direction = velocity_to_compass(gu, gv)
                 gauge_data.append({
                     "name": g["name"],
@@ -721,135 +841,113 @@ def run_tidal_cycle(river_flow: float = 1.0, tracer_diffusion: float = 0.5, dura
                     "speed": speed,
                     "flow": flow,
                     "direction": direction,
-                    "u": gu,
-                    "v": gv,
                 })
 
-            frames.append({
-                'h': h.copy(),
-                'tracer': np.array(tracer).copy(),
-                'tide': tide_level,
-                'gauges': gauge_data,
-            })
-            frame_times.append(t)
+            # Render frame
+            fig, ax = plt.subplots(figsize=(14, 10))
+            ax.set_xlim(extent[0], extent[1])
+            ax.set_ylim(extent[2], extent[3])
 
-            wet_area = np.sum(h > 0.01) * dx * dy / 1e6
+            if not basemap_failed:
+                try:
+                    ctx.add_basemap(ax, crs="EPSG:2193", source=ctx.providers.Esri.WorldImagery, zoom=15)
+                except Exception:
+                    pass
+
+            # Upsample for display
+            h_full = scipy_zoom(h, downsample, order=1)
+            river_full = scipy_zoom(river_tracer_np, downsample, order=1)
+            ocean_full = scipy_zoom(ocean_tracer_np, downsample, order=1)
+            h_full = h_full[:elev.data.shape[0], :elev.data.shape[1]]
+            river_full = river_full[:elev.data.shape[0], :elev.data.shape[1]]
+            ocean_full = ocean_full[:elev.data.shape[0], :elev.data.shape[1]]
+
+            # Create RGBA display using dual tracer color blending
+            wet = h_full > 0.05
+            rgba = blend_tracer_colors(river_full, ocean_full)
+            # Set alpha to 0 for dry cells
+            rgba[:, :, 3] = np.where(wet, 0.85, 0.0)
+
+            ax.imshow(rgba, origin='upper', extent=extent)
+
+            # Plot gauge markers
+            marker_colors = ['white', 'cyan', 'lime']
+            for gi, g in enumerate(gauges):
+                ax.plot(g["x"], g["y"], 'o', color=marker_colors[gi], markersize=10,
+                        markeredgecolor='black', markeredgewidth=1.5)
+                ax.annotate(g["name"], (g["x"], g["y"]), xytext=(5, 5),
+                            textcoords='offset points', fontsize=8, fontweight='bold',
+                            color='white', path_effects=[
+                                plt.matplotlib.patheffects.withStroke(linewidth=2, foreground='black')
+                            ])
+
+            # Custom legend for water source colors
+            from matplotlib.patches import Patch
+            legend_elements = [
+                Patch(facecolor=(1.0, 0.95, 0.0), edgecolor='black', label='River (yellow)'),
+                Patch(facecolor=(1.0, 0.1, 0.1), edgecolor='black', label='Ocean (red)'),
+                Patch(facecolor=(1.0, 0.5, 0.05), edgecolor='black', label='Mixed (orange)'),
+                Patch(facecolor=(0.2, 0.5, 0.9), edgecolor='black', label='Neutral (blue)'),
+            ]
+            ax.legend(handles=legend_elements, loc='upper right', fontsize=9)
+
+            wet_area_km2 = np.sum(h > 0.01) * dx * dy / 1e6
+            hours = int(t // 3600)
+            mins = int((t % 3600) // 60)
+
+            gauge_text = "Flow Gauges:\n"
+            for gd in gauge_data:
+                gauge_text += f"{gd['name']:12s} h={gd['depth']:.2f}m  v={gd['speed']:.2f}m/s {gd['direction']:>2s}  Q={gd['flow']:.1f}m³/s\n"
+
+            ax.set_title(
+                f"Waitangi Estuary - Tidal Simulation\n"
+                f"Time: {hours}h {mins:02d}m | Tide: {tide_level:+.2f}m | River: {river_flow:.1f} m³/s\n"
+                f"Flooded: {wet_area_km2:.2f} km² | Frame {frame_count+1}/{n_frames}",
+                fontsize=12, fontweight='bold'
+            )
+            ax.set_xlabel("Easting (m)")
+            ax.set_ylabel("Northing (m)")
+
+            ax.text(0.98, 0.02, gauge_text.strip(), transform=ax.transAxes,
+                    fontsize=9, verticalalignment='bottom', horizontalalignment='right',
+                    fontfamily='monospace', multialignment='left',
+                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
+
+            plt.tight_layout()
+
+            # Stream to ffmpeg or save to disk
+            if ffmpeg_available and ffmpeg_proc:
+                buf = io.BytesIO()
+                fig.savefig(buf, format='png', dpi=100, bbox_inches='tight', facecolor='white')
+                buf.seek(0)
+                ffmpeg_proc.stdin.write(buf.read())
+            else:
+                fig.savefig(output_dir / f"frame_{frame_count:04d}.png", dpi=100, bbox_inches='tight', facecolor='white')
+
+            plt.close(fig)
+            frame_count += 1
+
+            # Log progress
             elapsed = time.time() - start_time
             progress = (step + 1) / n_steps * 100
             log(f"  {progress:5.1f}% | t={t/3600:.2f}h | tide={tide_level:+.2f}m | "
-                  f"area={wet_area:.2f}km² | {elapsed:.0f}s elapsed")
-            # Log gauge data
-            gauge_str = " | ".join([f"{g['name']}: h={g['depth']:.2f}m v={g['speed']:.3f}m/s" for g in gauge_data])
-            log(f"    Gauges: {gauge_str}")
+                f"area={wet_area_km2:.2f}km² | frame {frame_count}/{n_frames} | {elapsed:.0f}s")
+
+    # Finalize ffmpeg
+    if ffmpeg_available and ffmpeg_proc:
+        # Close stdin and wait for ffmpeg to finish, collecting stderr
+        ffmpeg_proc.stdin.close()
+        stderr = ffmpeg_proc.stderr.read()
+        ffmpeg_proc.wait()
+        if ffmpeg_proc.returncode != 0:
+            log(f"ffmpeg error: {stderr.decode()}")
+        else:
+            log(f"\nVideo saved to: {video_path}")
+    elif not ffmpeg_available:
+        log(f"\nFrames saved to: {output_dir}/")
 
     elapsed = time.time() - start_time
-    log(f"\nSimulation complete in {elapsed:.1f}s ({n_steps/elapsed:.0f} steps/s)")
-    log(f"Generated {len(frames)} frames")
-
-    # Render frames
-    log("\n--- Rendering frames ---")
-    output_dir = Path("tidal_cycle_frames")
-    output_dir.mkdir(exist_ok=True)
-
-    for old in output_dir.glob("frame_*.png"):
-        old.unlink()
-
-    extent = [elev.bounds[0], elev.bounds[2], elev.bounds[1], elev.bounds[3]]
-    cmap = create_dual_tracer_colormap()
-
-    import contextily as ctx
-    from scipy.ndimage import zoom as scipy_zoom
-
-    for i, (frame, t) in enumerate(zip(frames, frame_times)):
-        fig, ax = plt.subplots(figsize=(14, 10))
-        ax.set_xlim(extent[0], extent[1])
-        ax.set_ylim(extent[2], extent[3])
-
-        try:
-            ctx.add_basemap(ax, crs="EPSG:2193", source=ctx.providers.Esri.WorldImagery, zoom=15)
-        except Exception as e:
-            log(f"  Warning: basemap failed: {e}")
-
-        # Upsample for display
-        h_full = scipy_zoom(frame['h'], downsample, order=1)
-        tracer_full = scipy_zoom(frame['tracer'], downsample, order=1)
-        h_full = h_full[:elev.data.shape[0], :elev.data.shape[1]]
-        tracer_full = tracer_full[:elev.data.shape[0], :elev.data.shape[1]]
-
-        wet = h_full > 0.05
-        display = np.where(wet, tracer_full, np.nan)
-
-        im = ax.imshow(display, cmap=cmap, origin='upper', extent=extent,
-                       vmin=0, vmax=1, alpha=0.85)
-
-        # Plot gauge markers
-        marker_colors = ['yellow', 'cyan', 'lime']
-        for gi, g in enumerate(gauges):
-            ax.plot(g["x"], g["y"], 'o', color=marker_colors[gi], markersize=10,
-                    markeredgecolor='black', markeredgewidth=1.5)
-            ax.annotate(g["name"], (g["x"], g["y"]), xytext=(5, 5),
-                        textcoords='offset points', fontsize=8, fontweight='bold',
-                        color='white', path_effects=[
-                            plt.matplotlib.patheffects.withStroke(linewidth=2, foreground='black')
-                        ])
-
-        cbar = plt.colorbar(im, ax=ax, shrink=0.4, pad=0.02)
-        cbar.set_label('Water Source', fontsize=10)
-        cbar.set_ticks([0, 0.5, 1.0])
-        cbar.set_ticklabels(['Ocean (pink)', 'Neutral (blue)', 'River (green)'])
-
-        wet_area_km2 = np.sum(frame['h'] > 0.01) * dx * dy / 1e6
-        hours = int(t // 3600)
-        mins = int((t % 3600) // 60)
-
-        # Build gauge info text
-        gauge_text = "Flow Gauges:\n"
-        for gi, gd in enumerate(frame['gauges']):
-            gauge_text += f"{gd['name']:12s} h={gd['depth']:.2f}m  v={gd['speed']:.2f}m/s {gd['direction']:>2s}  Q={gd['flow']:.1f}m³/s\n"
-
-        ax.set_title(
-            f"Waitangi Estuary - Tidal Simulation\n"
-            f"Time: {hours}h {mins:02d}m | Tide: {frame['tide']:+.2f}m | River: {river_flow:.1f} m³/s\n"
-            f"Flooded: {wet_area_km2:.2f} km² | Frame {i+1}/{len(frames)}",
-            fontsize=12, fontweight='bold'
-        )
-        ax.set_xlabel("Easting (m)")
-        ax.set_ylabel("Northing (m)")
-
-        # Add gauge data text box (bottom right, left-aligned text)
-        ax.text(0.98, 0.02, gauge_text.strip(), transform=ax.transAxes,
-                fontsize=9, verticalalignment='bottom', horizontalalignment='right',
-                fontfamily='monospace', multialignment='left',
-                bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
-
-        plt.tight_layout()
-        plt.savefig(output_dir / f"frame_{i:04d}.png", dpi=100, bbox_inches='tight', facecolor='white')
-        plt.close()
-
-        if (i + 1) % 10 == 0:
-            log(f"  Rendered {i+1}/{len(frames)} frames")
-
-    # Create video
-    log("\n--- Creating video ---")
-    video_path = "tidal_cycle.mp4"
-    try:
-        subprocess.run([
-            "ffmpeg", "-y",
-            "-framerate", "10",
-            "-i", str(output_dir / "frame_%04d.png"),
-            "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",
-            "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
-            "-crf", "18",
-            video_path,
-        ], check=True, capture_output=True, text=True)
-        log(f"Video saved to: {video_path}")
-    except subprocess.CalledProcessError as e:
-        log(f"ffmpeg error: {e.stderr}")
-    except FileNotFoundError:
-        log("ffmpeg not found - frames saved but video not created")
-
-    log(f"\nDone! Frames saved to: {output_dir}/")
+    log(f"Total time: {elapsed:.1f}s ({frame_count} frames, {n_steps/elapsed:.0f} sim steps/s)")
 
 
 if __name__ == "__main__":
