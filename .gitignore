@@ -55,14 +55,12 @@ dmypy.json
 *.h5
 *.hdf5
 .cache/
-data/
 
 # Outputs
 *.png
 *.jpg
 *.pdf
 *.svg
-*.geojson
 output/
 results/
 

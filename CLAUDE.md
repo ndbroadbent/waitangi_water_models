@@ -70,6 +70,16 @@ This explains why river water (green tracer) pools near Haruru Falls - the estua
 | `scripts/generate_mangrove_polygon.py` | Generate mangrove zone geojson |
 | `scripts/simple_tidal_test.py` | Earlier NumPy-based test |
 
+## Reference Points
+
+All ground-truth coordinates are in `src/waitangi/data/reference_points.py`:
+- **LANDMARKS**: Boat Ramp (-35.270798, 174.078968), Waitangi Bridge, Haruru Falls
+- **WATER_POINTS_WEST/EAST**: Known navigable water points
+- **LAND_POINTS**: Known land areas (never flooded)
+- **MANGROVE_POINTS**: Intertidal zones (flooded at high tide, not navigable)
+
+Used by `scripts/validate_geometry.py` for geometry validation.
+
 ## JAX/GPU Notes
 
 - Uses JAX with Metal backend (Apple Silicon)
