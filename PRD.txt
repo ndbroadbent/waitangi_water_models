@@ -1,0 +1,426 @@
+# Waitangi River Kayak Tidal Simulator – PRD
+
+## 1. Goal
+
+Build a **local, physically‑plausible simulator** for the **Waitangi River system** that predicts kayak motion as a function of:
+
+* Tide phase and strength
+* **River discharge driven by rainfall (baseline + storm response)**
+* Wind
+* User paddling effort
+
+Primary use case:
+
+> “If I launch at time T, with paddling speed X, what path will my kayak take?”
+
+Non‑goal:
+
+* Nautical‑grade navigation or open‑ocean accuracy
+
+---
+
+## 2. Core Questions the Product Answers
+
+* How strong is the river outflow *right now* given recent rain?
+* How far upstream does the tidal influence penetrate today?
+* Where is the cancellation / stagnation zone between tide and river?
+* How much paddling speed is required to hold position or progress upstream?
+* How do wind + rain together change the outcome?
+
+---
+
+## 3. Inputs
+
+### 3.1 Live river stage/flow (NEW, REQUIRED)
+
+This is the primary “truth signal” for discharge and is used for **trip planning in the next few hours**.
+
+Requirements:
+
+* Ingest **latest river level and/or flow** from an official gauge (ideally on Waitangi River, eg “Waitangi at Wakelins” or nearest suitable site).
+* Update cadence: at least every **15–60 minutes**.
+* Provide:
+
+  * Most recent value
+  * Last 24–72h time series
+  * Data quality flags if available
+
+Usage:
+
+* Convert stage/flow to model discharge boundary Q(t) and/or calibrate the runoff model state (soil wetness proxy).
+* If flow is not directly available, infer Q from stage using a rating curve (either published or fitted).
+
+---
+
+### 3.2 Tides (Time‑Varying Boundary Condition)
+
+Two supported modes.
+
+#### Option A – Calculated tides (baseline)
+
+* Semi‑diurnal + spring/neap modulation
+* Fit to a small set of recent official highs/lows
+
+Model:
+
+```
+h(t) = H_mean + A(t) * sin(ωt + φ)
+A(t) varies slowly over ~14 days (spring/neap)
+
+v_tide(t) ∝ dh/dt
+```
+
+#### Option B – Tide API / official tables (preferred for accuracy)
+
+* Pull official predictions for the nearest standard port and apply estuary transfer function.
+* Used to refresh Option A daily.
+
+---
+
+### 3.3 Rainfall (observations + forecast)
+
+Rain is used for **forecasting flow forward**, not as the sole driver.
+
+Inputs:
+
+* Hourly rainfall observations (past 24–72h)
+* Hourly rainfall forecast (next 48–168h)
+
+---
+
+### 3.4 Rain → flow model (forecasting)
+
+Purpose:
+
+* Project discharge Q(t) into the future when planning trips days to weeks ahead.
+
+Hydrograph response (calibratable):
+
+```
+Q(t) = Q_base + Q_rain(t)
+
+Q_rain(t) = Σ [ R(t_i) * K * exp(-(t - t_i)/τ) * step(t - t_i - delay) ]
+```
+
+State handling:
+
+* Maintain a simple **catchment wetness state** (0–1) inferred from recent rainfall + observed stage/flow.
+* Wet catchment increases effective runoff coefficient K.
+
+---
+
+### 3.5 River velocity field
+
+River discharge converted to surface velocity:
+
+```
+v_river(x,t) = V0(t) * exp(-x / L)
+```
+
+Where:
+
+* V0(t) derived from Q(t) (live gauge for nowcast, rainfall model for forecast)
+
+---
+
+### 3.6 Geometry
+
+* Official river/estuary geometry + bathymetry (depth)
+* Unstructured mesh preferred (triangles)
+
+---
+
+### 3.7 Wind
+
+Wind affects kayak, not water.
+
+Inputs:
+
+* Wind speed + direction (hourly)
+
+Model:
+
+```
+v_wind_effect = C_wind * v_wind * wind_dir
+```
+
+---
+
+### 3.8 Kayak + paddling
+
+Kayak state:
+
+* Position (x, y)
+* Velocity vector
+
+Paddling:
+
+* Speed relative to water (0–6 km/h)
+* Direction along river tangent or user bearing
+
+Total:
+
+```
+v_kayak = v_water(x,t) + v_paddle + v_wind_effect
+```
+
+---
+
+### 3.9 Planning horizons (key product behavior)
+
+**Nowcast (0–12h):**
+
+* Use live stage/flow as the primary discharge driver.
+* Use tide predictions for boundary.
+* Use wind forecast.
+* Rainfall only nudges the short-horizon forecast.
+
+**Near-term forecast (12h–7d):**
+
+* Start from current observed stage/flow and propagate with rainfall forecast.
+* Show an uncertainty band by varying runoff parameters and wetness state.
+
+**Medium forecast (1–4 weeks):**
+
+* Use tides (reliable weeks out).
+* Wind forecast becomes scenario-based (eg typical / breezy / windy) unless a long-range model is good enough.
+* Flow forecast becomes **assumption-based**:
+
+  * baseline dry
+  * typical seasonal
+  * post-rain / storm
+* As the date approaches (within 7 days), automatically switch to forecast-driven discharge, then within hours switch to gauge-driven discharge.
+
+## 4. Water Velocity Composition
+
+At each position and time:
+
+```
+v_water(x,t) = v_tide(t) * f_tide(x)
+              - v_river(x,t)
+              + v_eddy(x,y)
+```
+
+* `f_tide(x)` ramps from mouth → upstream
+* `v_eddy` optional curl noise near bends and pockets
+
+Cancellation zone naturally emerges where tidal and river terms balance.
+
+---
+
+## 5. Simulation Loop
+
+Time step:
+
+* Δt = 1–5 seconds
+
+Loop:
+
+1. Sample tide velocity
+2. Sample river velocity (rain‑aware)
+3. Combine water vector
+4. Add wind + paddling
+5. Integrate position (Euler or RK2)
+6. Record diagnostics
+
+---
+
+## 6. Outputs
+
+### 6.1 Visual
+
+* River map
+* Animated kayak path
+* Flow vectors
+* Highlighted shear / stagnation lines
+
+### 6.2 Graphs
+
+* Distance upstream vs time
+* Speed over ground vs time
+* Tide height
+* River discharge vs time (rain‑derived)
+
+### 6.3 Scenarios
+
+* No paddling
+* Gentle / strong paddling
+* Dry vs post‑storm river
+* Wind on/off
+
+---
+
+## 7. Calibration & Validation
+
+Method:
+
+* Kayak once
+* Record GPS track + time
+* Fit:
+
+  * Q_base
+  * K, τ, delay
+  * L
+
+Result:
+
+* **Locally accurate model**, even if globally crude
+
+---
+
+## 8. Architecture & Performance (GPU-first, no prototype)
+
+### Design principle
+
+This system is **GPU-first from day one**. There is **no CPU-only prototype phase**. All core numerical kernels, data layouts, and algorithms must be compatible with high-performance GPU execution from the outset.
+
+Goals:
+
+* Real-time or near–real-time simulation for interactive use
+* Scalable to higher resolution meshes without architectural changes
+* Deterministic, reproducible runs (important for calibration and learning)
+
+---
+
+### Compute model
+
+#### Core hydrodynamics
+
+* 2D depth-averaged velocity fields solved on **unstructured meshes**
+* Numerical methods chosen for GPU suitability:
+
+  * Explicit time-stepping
+  * Local stencils
+  * Minimal branching
+
+Supported approaches:
+
+* Custom shallow-water–style solver written directly for GPU
+* OR wrapping an existing solver that supports GPU acceleration (where available)
+
+---
+
+### GPU stack
+
+Preferred stacks (pick one early and commit):
+
+**Python-centric**
+
+* JAX (XLA) for kernels + autodiff (optional)
+* CuPy for array operations
+* Numba CUDA for custom kernels
+
+**Systems-centric**
+
+* CUDA C++ core solver
+* Python or Rust bindings for orchestration
+
+Non-goals:
+
+* Porting CPU code to GPU later
+* CPU-first reference implementations
+
+---
+
+### Data layout
+
+* Structure-of-arrays (SoA), not array-of-structures
+* Contiguous buffers for:
+
+  * Mesh nodes
+  * Mesh faces
+  * Velocity components
+  * Depth
+* Double buffering for time integration
+
+---
+
+### Kayak simulation
+
+* Kayaks treated as **Lagrangian particles** advected through Eulerian velocity fields
+* Particle integration entirely on GPU
+* Supports thousands of particles for visualization and pattern exploration
+
+---
+
+### Rendering
+
+* Velocity fields and particles exported directly to GPU-friendly formats
+* Web rendering via WebGPU / Deck.gl, or native GPU visualization (PyVista)
+
+---
+
+### Performance targets
+
+* ≥ 60 FPS for particle advection on consumer GPU
+* Hydrodynamics timestep ≤ 1–5 seconds simulated per frame
+* Ability to recompute short-horizon nowcasts (0–12h) interactively
+
+---
+
+### Validation constraint
+
+All validation tooling (comparison to GPS tracks, gauge data) must:
+
+* Run against the same GPU code paths
+* Avoid separate “slow but correct” CPU implementations
+
+## 9. Data Sources (NZ, official)
+
+### Geometry + bathymetry
+
+* **LINZ NZ Bathymetric Data Index** to locate freely available bathymetry holdings used for charts citeturn5search1
+* LINZ **Hydrographic data** overview (ENC-derived products via LINZ Data Service) citeturn5search9
+* LINZ chart rasters for local context (Bay of Islands charts are available) citeturn5search5
+* Optional: LINZ scanned sounding sheet index (for additional depth detail where present) citeturn5search17
+* Optional: NIWA NZ Bathymetry Data product for broader gridded background citeturn5search21
+
+### River level / flow and rainfall (assimilation)
+
+* **Northland Regional Council Environmental Data Hub** includes river level/flow and rainfall monitoring citeturn5search4turn5search0
+* NRC Open Data portal (ArcGIS) may expose related layers for catchments and monitoring metadata citeturn5search20
+
+### Weather (wind + rainfall forecast)
+
+* **MetService Point Forecast API** (paid, enterprise-grade) citeturn5search2turn5search14turn5search22
+
+---
+
+## 10. Roadmap to “highest possible standard”
+
+### Phase 1: 2D advection model (weeks)
+
+* Build mesh from official geometry
+* Tide boundary at mouth + simple friction
+* River discharge from gauge (preferred) + rainfall forecast projection
+* Produce u(x,y,t) and animate kayak paths
+
+### Phase 2: 2D shallow-water solver (months)
+
+* Adopt Delft3D FM / TELEMAC / ANUGA
+* Calibrate roughness and boundary conditions using:
+
+  * NRC river stage/flow time series
+  * One or more kayak GPS tracks
+
+### Phase 3: Data assimilation + nowcasting
+
+* Hourly update: ingest latest gauge + rainfall
+* Re-run short horizon forecast (6–24h) and cache velocity fields
+* Show uncertainty bands (dry vs wet catchment states)
+
+---
+
+## 11. Explicit Non-Goals
+
+* Full 3D stratification
+* Safety-critical navigation
+* Regional generalization
+
+---
+
+## 12. Success Criteria
+
+* Correct drift direction and turnaround timing
+* Matches observed GPS tracks after calibration
+* Produces believable eddies/shear patterns near pockets and bends
