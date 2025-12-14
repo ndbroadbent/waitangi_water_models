@@ -203,7 +203,7 @@ def velocity_to_compass(u: float, v: float) -> str:
 
 
 @jit
-def advect_tracer(tracer, h, h_new, u, v, h_e, h_n, dx, dy, dt, tracer_diffusion):
+def advect_tracer(tracer, h, h_new, u, v, h_e, h_n, dx, dy, dt, tracer_diffusion, source_mask, source_value):
     """Advect and diffuse a single tracer field.
 
     Args:
@@ -214,10 +214,16 @@ def advect_tracer(tracer, h, h_new, u, v, h_e, h_n, dx, dy, dt, tracer_diffusion
         h_e, h_n: Upwind depths at cell faces
         dx, dy, dt: Grid spacing and timestep
         tracer_diffusion: Diffusion coefficient
+        source_mask: Boolean mask where tracer is injected
+        source_value: Value to inject at source (typically 1.0)
 
     Returns:
         Updated tracer field
     """
+    # FIRST: Ensure source cells have the correct tracer value BEFORE advection reads them
+    # This is critical for proper inflow boundary conditions
+    tracer = jnp.where(source_mask, source_value, tracer)
+
     # Upwind tracer values at cell faces
     tracer_e = jnp.where(u[:-1, :] > 0, tracer[:-1, :], tracer[1:, :])
     tracer_n = jnp.where(v[:, :-1] > 0, tracer[:, :-1], tracer[:, 1:])
@@ -253,11 +259,15 @@ def advect_tracer(tracer, h, h_new, u, v, h_e, h_n, dx, dy, dt, tracer_diffusion
     # Ensure dry cells stay at zero
     tracer = jnp.where(wet_new, tracer, 0.0)
 
+    # FINALLY: Re-enforce source boundary condition after all calculations
+    tracer = jnp.where(source_mask & wet_new, source_value, tracer)
+
     return tracer
 
 
 @jit
-def simulation_step(eta, u, v, river_tracer, ocean_tracer, z_bed, manning_field, params, tracer_diffusion: float = 5.0):
+def simulation_step(eta, u, v, river_tracer, ocean_tracer, z_bed, manning_field, params,
+                    river_mask, ocean_inlet_mask, tracer_diffusion: float = 5.0):
     """Single simulation timestep - JIT compiled for GPU.
 
     Args:
@@ -268,6 +278,8 @@ def simulation_step(eta, u, v, river_tracer, ocean_tracer, z_bed, manning_field,
         z_bed: Bed elevation
         manning_field: Spatially-varying Manning's n coefficient
         params: (dx, dy, dt, g, max_vel)
+        river_mask: Boolean mask for river source cells
+        ocean_inlet_mask: Boolean mask for ocean inlet cells
         tracer_diffusion: Diffusion coefficient for tracers (0 = no diffusion)
 
     Returns:
@@ -335,11 +347,13 @@ def simulation_step(eta, u, v, river_tracer, ocean_tracer, z_bed, manning_field,
     eta = eta - dt * div
     eta = jnp.maximum(eta, z_bed)
 
-    # Advect both tracers
+    # Advect both tracers with their source masks
     h_new = jnp.maximum(eta - z_bed, 0.0)
 
-    river_tracer = advect_tracer(river_tracer, h, h_new, u, v, h_e, h_n, dx, dy, dt, tracer_diffusion)
-    ocean_tracer = advect_tracer(ocean_tracer, h, h_new, u, v, h_e, h_n, dx, dy, dt, tracer_diffusion)
+    river_tracer = advect_tracer(river_tracer, h, h_new, u, v, h_e, h_n, dx, dy, dt,
+                                  tracer_diffusion, river_mask, 1.0)
+    ocean_tracer = advect_tracer(ocean_tracer, h, h_new, u, v, h_e, h_n, dx, dy, dt,
+                                  tracer_diffusion, ocean_inlet_mask, 1.0)
 
     return eta, u, v, river_tracer, ocean_tracer
 
@@ -473,11 +487,15 @@ def run_equilibrium_test():
     # Create a manning field (uniform for test)
     manning_field = jnp.full((ny, nx), manning_n)
 
+    # Empty masks for equilibrium test (no tracer injection)
+    empty_mask = jnp.zeros((ny, nx), dtype=bool)
+
     # Warm up JIT
     log("\nWarming up JIT compilation...")
     start = time.time()
     eta, u, v, river_tracer, ocean_tracer = simulation_step(
-        eta, u, v, river_tracer, ocean_tracer, z_bed, manning_field, params
+        eta, u, v, river_tracer, ocean_tracer, z_bed, manning_field, params,
+        empty_mask, empty_mask
     )
     # Use hydro-only boundary conditions for equilibrium test
     eta, u, v = apply_boundary_conditions_hydro(
@@ -496,7 +514,8 @@ def run_equilibrium_test():
 
     for step in range(n_steps):
         eta, u, v, river_tracer, ocean_tracer = simulation_step(
-            eta, u, v, river_tracer, ocean_tracer, z_bed, manning_field, params
+            eta, u, v, river_tracer, ocean_tracer, z_bed, manning_field, params,
+            empty_mask, empty_mask
         )
         eta, u, v = apply_boundary_conditions_hydro(
             eta, u, v, z_bed, dam_mask, high_tide,
@@ -713,10 +732,14 @@ def run_tidal_cycle(river_flow: float = 1.0, tracer_diffusion: float = 0.5, dura
     river_tracer = jnp.zeros((ny, nx))
     ocean_tracer = jnp.zeros((ny, nx))
 
+    # Empty masks for equilibration (no tracer injection)
+    empty_mask = jnp.zeros((ny, nx), dtype=bool)
+
     # Warm up JIT (no tracer injection during warmup)
     log("Warming up JIT...")
     eta, u, v, river_tracer, ocean_tracer = simulation_step(
-        eta, u, v, river_tracer, ocean_tracer, z_bed, manning_field, params, tracer_diffusion
+        eta, u, v, river_tracer, ocean_tracer, z_bed, manning_field, params,
+        empty_mask, empty_mask, tracer_diffusion
     )
     eta, u, v = apply_boundary_conditions_hydro(
         eta, u, v, z_bed, wall_mask, low_tide,
@@ -728,7 +751,8 @@ def run_tidal_cycle(river_flow: float = 1.0, tracer_diffusion: float = 0.5, dura
     log("Equilibrating at low tide (no tracer injection)...")
     for _ in range(2000):
         eta, u, v, river_tracer, ocean_tracer = simulation_step(
-            eta, u, v, river_tracer, ocean_tracer, z_bed, manning_field, params, tracer_diffusion
+            eta, u, v, river_tracer, ocean_tracer, z_bed, manning_field, params,
+            empty_mask, empty_mask, tracer_diffusion
         )
         eta, u, v = apply_boundary_conditions_hydro(
             eta, u, v, z_bed, wall_mask, low_tide,
@@ -803,9 +827,10 @@ def run_tidal_cycle(river_flow: float = 1.0, tracer_diffusion: float = 0.5, dura
         # Current tide level (start at low tide, rising)
         tide_level = mean_tide + tide_amplitude * np.sin(2 * np.pi * t / tide_period - np.pi/2)
 
-        # Simulation step with spatially-varying friction
+        # Simulation step with spatially-varying friction and tracer injection
         eta, u, v, river_tracer, ocean_tracer = simulation_step(
-            eta, u, v, river_tracer, ocean_tracer, z_bed, manning_field, params, tracer_diffusion
+            eta, u, v, river_tracer, ocean_tracer, z_bed, manning_field, params,
+            river_mask, ocean_inlet_mask, tracer_diffusion
         )
 
         # Apply boundary: wall cells are clamped to tide level
