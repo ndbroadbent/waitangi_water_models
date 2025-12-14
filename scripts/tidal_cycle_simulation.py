@@ -151,6 +151,26 @@ def create_dual_tracer_colormap():
     return LinearSegmentedColormap.from_list("ocean_river", colors)
 
 
+def velocity_to_compass(u: float, v: float) -> str:
+    """Convert u,v velocity components to compass direction.
+
+    Note: In our grid, u is east-west (positive = east) and v is north-south (positive = north).
+    """
+    speed = np.sqrt(u**2 + v**2)
+    if speed < 0.001:
+        return "--"
+
+    # Calculate angle in degrees (0 = East, 90 = North)
+    angle = np.degrees(np.arctan2(v, u))
+    # Convert to compass bearing (0 = North, 90 = East)
+    bearing = (90 - angle) % 360
+
+    # 8-point compass
+    directions = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+    idx = int((bearing + 22.5) / 45) % 8
+    return directions[idx]
+
+
 @jit
 def simulation_step(eta, u, v, tracer, z_bed, manning_field, params, tracer_diffusion: float = 5.0):
     """Single simulation timestep - JIT compiled for GPU.
@@ -246,18 +266,21 @@ def simulation_step(eta, u, v, tracer, z_bed, manning_field, params, tracer_diff
 
     h_safe = jnp.maximum(h_new, 0.01)
     wet_new = h_new > 0.01
-    tracer = jnp.where(wet_new, (tracer * h - dt * tracer_div) / h_safe, 0.0)
+    # Dry cells keep neutral value (0.5) - prevents pink leaking from boundaries
+    tracer = jnp.where(wet_new, (tracer * h - dt * tracer_div) / h_safe, 0.5)
     tracer = jnp.clip(tracer, 0.0, 1.0)
 
     # Tracer diffusion (optional - set to 0 for permanent dye tracking)
-    tracer_padded = jnp.pad(tracer, 1, mode='edge')
+    # Pad with 0.5 (neutral) to prevent boundary artifacts
+    tracer_padded = jnp.pad(tracer, 1, mode='constant', constant_values=0.5)
     lap = (
         tracer_padded[:-2, 1:-1] + tracer_padded[2:, 1:-1] +
         tracer_padded[1:-1, :-2] + tracer_padded[1:-1, 2:] - 4 * tracer
     ) / (dx * dy)
     tracer = tracer + tracer_diffusion * dt * lap
     tracer = jnp.clip(tracer, 0.0, 1.0)
-    tracer = jnp.where(wet_new, tracer, 0.0)
+    # Ensure dry cells stay neutral
+    tracer = jnp.where(wet_new, tracer, 0.5)
 
     return eta, u, v, tracer
 
@@ -284,10 +307,12 @@ def apply_boundary_conditions_hydro(eta, u, v, z_bed, dam_mask, dam_level,
 
 @jit
 def apply_boundary_conditions_full(eta, u, v, tracer, z_bed, dam_mask, dam_level,
-                                    river_mask, river_level, river_dh):
+                                    river_mask, river_level, river_dh,
+                                    ocean_inlet_mask):
     """Apply full boundary conditions including tracer injection.
 
-    Dam acts as spillway + injects ocean tracer (0).
+    Dam acts as spillway (controls water level across entire wall).
+    Ocean tracer injected only at ocean_inlet_mask (small section).
     River source adds water + injects river tracer (1).
     """
     # Dam spillway: clamp water level to dam height
@@ -297,11 +322,11 @@ def apply_boundary_conditions_full(eta, u, v, tracer, z_bed, dam_mask, dam_level
     eta = jnp.where(river_mask, eta + river_dh, eta)
     eta = jnp.where(river_mask, jnp.maximum(eta, river_level), eta)
 
-    # Tracer sources
+    # Tracer sources - use ocean_inlet_mask for tracer (not entire dam_mask)
     h = jnp.maximum(eta - z_bed, 0.0)
     wet = h > 0.01
-    tracer = jnp.where(river_mask & wet, 1.0, tracer)  # River = green
-    tracer = jnp.where(dam_mask & wet, 0.0, tracer)    # Ocean = pink
+    tracer = jnp.where(river_mask & wet, 1.0, tracer)        # River = green
+    tracer = jnp.where(ocean_inlet_mask & wet, 0.0, tracer)  # Ocean inlet = pink
 
     return eta, u, v, tracer
 
@@ -484,7 +509,7 @@ def run_equilibrium_test():
     return final_area, expected_area
 
 
-def run_tidal_cycle(river_flow: float = 1.0, tracer_diffusion: float = 0.5):
+def run_tidal_cycle(river_flow: float = 1.0, tracer_diffusion: float = 0.5, duration_hours: float | None = None):
     """Full tidal cycle simulation with wall boundary.
 
     The wall is a 1-cell-wide barrier at the eastern edge of the estuary.
@@ -541,11 +566,21 @@ def run_tidal_cycle(river_flow: float = 1.0, tracer_diffusion: float = 0.5):
     # Only where there's actually water channel (not on land)
     wall_mask_np = wall_mask_np & (z_bed_np < 10.0)
 
-    # River source at Haruru Falls
+    # River source at Haruru Falls - circular mask
     falls_row, falls_col = 214, 24
     river_radius = 3
     yy, xx = np.ogrid[:ny, :nx]
     river_mask_np = ((yy - falls_row)**2 + (xx - falls_col)**2) <= river_radius**2
+    river_cells = np.sum(river_mask_np)
+
+    # Ocean inlet mask - this is where we COLOR incoming ocean water pink
+    # The wall boundary at column 382 is where water enters when tide rises
+    # We need to color water AT THE WALL, not inside the domain
+    # Use the wall mask itself as the ocean inlet - all water entering through the wall is ocean water
+    ocean_inlet_mask_np = wall_mask_np.copy()
+    ocean_inlet_cells = np.sum(ocean_inlet_mask_np)
+    log(f"Ocean inlet: using wall mask ({ocean_inlet_cells} cells at column {wall_col})")
+    log(f"River source: {river_cells} cells at row {falls_row}, col {falls_col}")
 
     # Virtual flow gauges - measure velocity and depth at key locations
     # Coordinates converted from WGS84 to grid indices
@@ -584,6 +619,7 @@ def run_tidal_cycle(river_flow: float = 1.0, tracer_diffusion: float = 0.5):
     wall_mask = jnp.array(wall_mask_np)
     river_mask = jnp.array(river_mask_np)
     manning_field = jnp.array(manning_np)
+    ocean_inlet_mask = jnp.array(ocean_inlet_mask_np)
     params = (dx, dy, dt, g, max_vel)
 
     # River inflow per timestep
@@ -624,7 +660,10 @@ def run_tidal_cycle(river_flow: float = 1.0, tracer_diffusion: float = 0.5):
     tracer = jnp.full((ny, nx), 0.5)
 
     # Simulation parameters
-    duration = tide_period  # One full cycle
+    if duration_hours is not None:
+        duration = duration_hours * 3600
+    else:
+        duration = tide_period  # One full cycle
     n_steps = int(duration / dt)
     output_interval = 300  # 5 minutes between frames
     steps_per_output = int(output_interval / dt)
@@ -653,7 +692,8 @@ def run_tidal_cycle(river_flow: float = 1.0, tracer_diffusion: float = 0.5):
         # Use full version to inject tracers during main simulation
         eta, u, v, tracer = apply_boundary_conditions_full(
             eta, u, v, tracer, z_bed, wall_mask, tide_level,
-            river_mask, tide_level + 1.0, river_dh
+            river_mask, tide_level + 1.0, river_dh,
+            ocean_inlet_mask
         )
 
         # Save frame
@@ -674,11 +714,13 @@ def run_tidal_cycle(river_flow: float = 1.0, tracer_diffusion: float = 0.5):
                 speed = np.sqrt(gu**2 + gv**2)
                 # Flow rate Q = velocity * depth * width (estimate width as dx)
                 flow = speed * gh * dx  # m³/s (approximate, assumes flow perpendicular to cell)
+                direction = velocity_to_compass(gu, gv)
                 gauge_data.append({
                     "name": g["name"],
                     "depth": gh,
                     "speed": speed,
                     "flow": flow,
+                    "direction": direction,
                     "u": gu,
                     "v": gv,
                 })
@@ -696,6 +738,9 @@ def run_tidal_cycle(river_flow: float = 1.0, tracer_diffusion: float = 0.5):
             progress = (step + 1) / n_steps * 100
             log(f"  {progress:5.1f}% | t={t/3600:.2f}h | tide={tide_level:+.2f}m | "
                   f"area={wet_area:.2f}km² | {elapsed:.0f}s elapsed")
+            # Log gauge data
+            gauge_str = " | ".join([f"{g['name']}: h={g['depth']:.2f}m v={g['speed']:.3f}m/s" for g in gauge_data])
+            log(f"    Gauges: {gauge_str}")
 
     elapsed = time.time() - start_time
     log(f"\nSimulation complete in {elapsed:.1f}s ({n_steps/elapsed:.0f} steps/s)")
@@ -760,7 +805,7 @@ def run_tidal_cycle(river_flow: float = 1.0, tracer_diffusion: float = 0.5):
         # Build gauge info text
         gauge_text = "Flow Gauges:\n"
         for gi, gd in enumerate(frame['gauges']):
-            gauge_text += f"  {gd['name']}: h={gd['depth']:.2f}m, v={gd['speed']:.2f}m/s, Q≈{gd['flow']:.1f}m³/s\n"
+            gauge_text += f"{gd['name']:12s} h={gd['depth']:.2f}m  v={gd['speed']:.2f}m/s {gd['direction']:>2s}  Q={gd['flow']:.1f}m³/s\n"
 
         ax.set_title(
             f"Waitangi Estuary - Tidal Simulation\n"
@@ -771,9 +816,10 @@ def run_tidal_cycle(river_flow: float = 1.0, tracer_diffusion: float = 0.5):
         ax.set_xlabel("Easting (m)")
         ax.set_ylabel("Northing (m)")
 
-        # Add gauge data text box
-        ax.text(0.02, 0.02, gauge_text.strip(), transform=ax.transAxes,
-                fontsize=9, verticalalignment='bottom', fontfamily='monospace',
+        # Add gauge data text box (bottom right, left-aligned text)
+        ax.text(0.98, 0.02, gauge_text.strip(), transform=ax.transAxes,
+                fontsize=9, verticalalignment='bottom', horizontalalignment='right',
+                fontfamily='monospace', multialignment='left',
                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
 
         plt.tight_layout()
@@ -818,6 +864,8 @@ if __name__ == "__main__":
                         help="Disable tracer diffusion (permanent dye tracking)")
     parser.add_argument("--diffusion", type=float, default=0.5,
                         help="Tracer diffusion coefficient (default: 0.5, realistic for estuarine turbulence)")
+    parser.add_argument("--duration", type=float, default=None,
+                        help="Simulation duration in hours (default: full tidal cycle ~12.4h)")
 
     args = parser.parse_args()
 
@@ -826,4 +874,5 @@ if __name__ == "__main__":
     if args.command == "test":
         run_equilibrium_test()
     else:
-        run_tidal_cycle(river_flow=args.river_flow, tracer_diffusion=tracer_diffusion)
+        run_tidal_cycle(river_flow=args.river_flow, tracer_diffusion=tracer_diffusion,
+                        duration_hours=args.duration)
