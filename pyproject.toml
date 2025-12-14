@@ -19,8 +19,9 @@ classifiers = [
 ]
 
 dependencies = [
-    "jax>=0.4.35",
-    "jaxlib>=0.4.35",
+    "jax==0.4.35",
+    "jaxlib==0.4.35",
+    "jax-metal==0.1.1",
     "numpy>=2.0.0",
     "scipy>=1.14.0",
     "pandas>=2.2.0",
@@ -37,6 +38,7 @@ dependencies = [
     "rich>=13.9.0",
     "typer>=0.13.0",
     "contextily>=1.7.0",
+    "scikit-image>=0.25.2",
 ]
 
 [project.optional-dependencies]
@@ -47,9 +49,6 @@ dev = [
     "ruff>=0.8.0",
     "mypy>=1.13.0",
     "pre-commit>=4.0.0",
-]
-gpu = [
-    "jax[cuda12]>=0.4.35",
 ]
 viz = [
     "pyvista>=0.44.0",
