@@ -2,10 +2,14 @@
 
 Fetches 1m resolution elevation data from LINZ Cloud-Optimized GeoTIFFs
 to model water volume at different tide levels.
+
+Data is cached to disk to avoid repeated downloads.
 """
 
+import hashlib
+import pickle
 from dataclasses import dataclass
-from functools import lru_cache
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -18,6 +22,9 @@ from waitangi.data.estuary_geometry import VISUALIZATION_BBOX_WGS84
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
+
+# Cache directory for elevation data
+CACHE_DIR = Path.home() / ".cache" / "waitangi_water_models"
 
 # LINZ LiDAR DEM Cloud-Optimized GeoTIFF URLs
 # National composite DEM at 1m resolution
@@ -61,17 +68,69 @@ def get_dem_url(sheet: str = WAITANGI_DEM_SHEET) -> str:
     return f"{LINZ_DEM_BASE_URL}/{sheet}.tiff"
 
 
-@lru_cache(maxsize=1)
+def _get_cache_key() -> str:
+    """Generate a cache key based on the visualization bbox and DEM sheet."""
+    key_data = f"{VISUALIZATION_BBOX_WGS84}:{WAITANGI_DEM_SHEET}"
+    return hashlib.md5(key_data.encode()).hexdigest()[:12]
+
+
+def _get_cache_path() -> Path:
+    """Get the path to the cached elevation data file."""
+    return CACHE_DIR / f"elevation_{_get_cache_key()}.pkl"
+
+
+def _load_from_cache() -> ElevationData | None:
+    """Load elevation data from disk cache if available."""
+    cache_path = _get_cache_path()
+    if cache_path.exists():
+        try:
+            with open(cache_path, "rb") as f:
+                return pickle.load(f)
+        except (pickle.PickleError, EOFError, OSError):
+            # Cache corrupted, delete it
+            cache_path.unlink(missing_ok=True)
+    return None
+
+
+def _save_to_cache(data: ElevationData) -> None:
+    """Save elevation data to disk cache."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path = _get_cache_path()
+    with open(cache_path, "wb") as f:
+        pickle.dump(data, f)
+
+
+# In-memory cache for current session (avoids repeated disk reads)
+_elevation_cache: ElevationData | None = None
+
+
 def fetch_waitangi_elevation() -> ElevationData:
     """Fetch elevation data for the Waitangi visualization area.
 
     Uses Cloud-Optimized GeoTIFF to efficiently fetch only the required
     subset of the 1m resolution LiDAR DEM.
 
+    Data is cached to disk at ~/.cache/waitangi_water_models/ to avoid
+    repeated downloads from LINZ cloud.
+
     Returns:
         ElevationData with elevation values in meters relative to NZVD2016.
         Negative values represent areas below mean sea level.
     """
+    global _elevation_cache
+
+    # Check in-memory cache first (fastest)
+    if _elevation_cache is not None:
+        return _elevation_cache
+
+    # Check disk cache
+    cached = _load_from_cache()
+    if cached is not None:
+        _elevation_cache = cached
+        return cached
+
+    # Fetch from LINZ cloud
+    print("Fetching elevation data from LINZ cloud (will be cached to disk)...")
     transformer = _get_transformer_to_nztm()
 
     # Convert visualization bbox to NZTM
@@ -97,7 +156,7 @@ def fetch_waitangi_elevation() -> ElevationData:
         east = west + data.shape[1] * win_transform.a
         south = north + data.shape[0] * win_transform.e
 
-        return ElevationData(
+        elevation_data = ElevationData(
             data=data.astype(np.float32),
             transform=win_transform,
             crs=str(src.crs),
@@ -105,6 +164,15 @@ def fetch_waitangi_elevation() -> ElevationData:
             resolution=abs(win_transform.a),
             nodata=src.nodata,
         )
+
+    # Save to disk cache
+    _save_to_cache(elevation_data)
+    print(f"Elevation data cached to {_get_cache_path()}")
+
+    # Store in memory cache
+    _elevation_cache = elevation_data
+
+    return elevation_data
 
 
 def get_elevation_at_point(

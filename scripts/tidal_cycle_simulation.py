@@ -43,6 +43,12 @@ jax.config.update("jax_enable_x64", False)
 MANNING_OPEN_WATER = 0.035  # Open channels
 MANNING_MANGROVE = 0.12     # Dense mangrove vegetation
 
+# Kayak parameters (3.9m x 0.81m double fishing kayak)
+KAYAK_LENGTH = 3.9  # meters
+KAYAK_WIDTH = 0.81  # meters
+BOAT_RAMP_LAT = -35.270801
+BOAT_RAMP_LON = 174.078956
+
 
 def load_mangrove_mask(ny: int, nx: int, extent: tuple, downsample: int) -> np.ndarray:
     """Load mangrove zones from GeoJSON and rasterize to grid.
@@ -200,6 +206,117 @@ def velocity_to_compass(u: float, v: float) -> str:
     directions = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
     idx = int((bearing + 22.5) / 45) % 8
     return directions[idx]
+
+
+def interpolate_velocity(x: float, y: float, u: np.ndarray, v: np.ndarray,
+                         extent: tuple, ny: int, nx: int) -> tuple[float, float]:
+    """Bilinear interpolation of velocity at a point (NZTM coordinates).
+
+    Args:
+        x, y: Position in NZTM coordinates
+        u, v: Velocity arrays (ny, nx)
+        extent: (xmin, xmax, ymin, ymax) in NZTM
+        ny, nx: Grid dimensions
+
+    Returns:
+        (u_interp, v_interp): Interpolated velocity components in m/s
+    """
+    xmin, xmax, ymin, ymax = extent
+    dx = (xmax - xmin) / nx
+    dy = (ymax - ymin) / ny
+
+    # Convert to grid coordinates (note: y increases northward, row 0 is north)
+    col = (x - xmin) / dx
+    row = (ymax - y) / dy  # Flip because row 0 = north (top of image)
+
+    # Bounds check
+    if row < 0 or row >= ny - 1 or col < 0 or col >= nx - 1:
+        return 0.0, 0.0
+
+    # Integer and fractional parts
+    r0, c0 = int(row), int(col)
+    r1, c1 = r0 + 1, c0 + 1
+    fr, fc = row - r0, col - c0
+
+    # Bilinear interpolation
+    u_interp = (u[r0, c0] * (1-fr) * (1-fc) +
+                u[r0, c1] * (1-fr) * fc +
+                u[r1, c0] * fr * (1-fc) +
+                u[r1, c1] * fr * fc)
+
+    v_interp = (v[r0, c0] * (1-fr) * (1-fc) +
+                v[r0, c1] * (1-fr) * fc +
+                v[r1, c0] * fr * (1-fc) +
+                v[r1, c1] * fr * fc)
+
+    return float(u_interp), float(v_interp)
+
+
+def advect_kayak(kayak_x: float, kayak_y: float, u: np.ndarray, v: np.ndarray,
+                 extent: tuple, ny: int, nx: int, dt: float) -> tuple[float, float]:
+    """Advect kayak position using water velocity (pure drift, no paddling).
+
+    Args:
+        kayak_x, kayak_y: Current kayak position in NZTM coordinates
+        u, v: Velocity arrays
+        extent: Grid extent
+        ny, nx: Grid dimensions
+        dt: Time step in seconds
+
+    Returns:
+        (new_x, new_y): Updated kayak position
+    """
+    u_vel, v_vel = interpolate_velocity(kayak_x, kayak_y, u, v, extent, ny, nx)
+
+    # Simple Euler integration
+    # Note: u is eastward (positive x), v is northward (positive y)
+    new_x = kayak_x + u_vel * dt
+    new_y = kayak_y + v_vel * dt
+
+    return new_x, new_y
+
+
+def draw_kayak_diamond(ax, x: float, y: float, heading: float,
+                       length: float = KAYAK_LENGTH, width: float = KAYAK_WIDTH):
+    """Draw kayak as a diamond shape on the plot.
+
+    Args:
+        ax: Matplotlib axes
+        x, y: Kayak center position in NZTM coordinates
+        heading: Heading angle in degrees (0 = North, clockwise)
+        length: Kayak length in meters
+        width: Kayak width in meters
+    """
+    from matplotlib.patches import Polygon
+
+    # Diamond vertices (bow, starboard, stern, port)
+    # In local coords: bow at +length/2, stern at -length/2
+    half_len = length / 2
+    half_wid = width / 2
+
+    # Diamond shape: pointed at bow and stern, wide in middle
+    local_verts = np.array([
+        [half_len, 0],      # Bow (front)
+        [0, half_wid],      # Starboard (right)
+        [-half_len, 0],     # Stern (back)
+        [0, -half_wid],     # Port (left)
+    ])
+
+    # Rotate by heading (convert from compass to math angle)
+    # Compass: 0=N, 90=E. Math: 0=E, 90=N
+    # So math_angle = 90 - compass
+    angle_rad = np.radians(90 - heading)
+    cos_a, sin_a = np.cos(angle_rad), np.sin(angle_rad)
+    rot = np.array([[cos_a, -sin_a], [sin_a, cos_a]])
+
+    rotated = local_verts @ rot.T
+    world_verts = rotated + np.array([x, y])
+
+    # Draw the kayak
+    kayak_patch = Polygon(world_verts, closed=True,
+                          facecolor='lime', edgecolor='black',
+                          linewidth=2, zorder=20)
+    ax.add_patch(kayak_patch)
 
 
 @jit
@@ -644,21 +761,27 @@ def run_tidal_cycle(river_flow: float = 1.0, tracer_diffusion: float = 0.5, dura
 
     # Wall location - at longitude 174.083008 (-35.271313, 174.083008)
     # Calculated: NZTM x=1698501 -> column 382
+    # Northern limit at -35.271322, 174.082900 -> row 124
     wall_col = 382
+    wall_north_row = 124  # Wall only exists from row 124 southward
 
     # Set up the domain:
     # - Everything east of wall is "outside" (set bed very high so no water there)
     # - The wall itself will have eta clamped to tide level
     # - North/south boundaries are walls
-    z_bed_np[:, wall_col+1:] = 100.0  # Outside domain - very high
+    z_bed_np[wall_north_row:, wall_col+1:] = 100.0  # Outside domain - very high (only south of wall limit)
     z_bed_np[:8, :] = 20.0   # North wall
     z_bed_np[-8:, :] = 20.0  # South wall
 
-    # Wall mask - the single column where we enforce tide level
+    # Wall mask - the single column where we enforce tide level (only south of northern limit)
     wall_mask_np = np.zeros((ny, nx), dtype=bool)
-    wall_mask_np[:, wall_col] = True
-    # Only where there's actually water channel (not on land)
+    wall_mask_np[wall_north_row:, wall_col] = True  # Only from row 124 southward
+    # Only where there's actually water channel (not on steep land)
     wall_mask_np = wall_mask_np & (z_bed_np < 10.0)
+
+    # Lower the bed at wall cells so water can always be present at tide level
+    # This ensures ocean tracer can be injected even at low tide
+    z_bed_np[wall_mask_np] = np.minimum(z_bed_np[wall_mask_np], low_tide - 1.0)
 
     # River source at Haruru Falls - circular mask
     falls_row, falls_col = 214, 24
@@ -667,13 +790,11 @@ def run_tidal_cycle(river_flow: float = 1.0, tracer_diffusion: float = 0.5, dura
     river_mask_np = ((yy - falls_row)**2 + (xx - falls_col)**2) <= river_radius**2
     river_cells = np.sum(river_mask_np)
 
-    # Ocean inlet mask - this is where we COLOR incoming ocean water pink
-    # The wall boundary at column 382 is where water enters when tide rises
-    # We need to color water AT THE WALL, not inside the domain
-    # Use the wall mask itself as the ocean inlet - all water entering through the wall is ocean water
+    # Ocean inlet mask - the wall cells themselves where tide level is enforced
+    # Since eta is clamped to tide level here, any water in these cells is ocean water
     ocean_inlet_mask_np = wall_mask_np.copy()
     ocean_inlet_cells = np.sum(ocean_inlet_mask_np)
-    log(f"Ocean inlet: using wall mask ({ocean_inlet_cells} cells at column {wall_col})")
+    log(f"Ocean inlet: {ocean_inlet_cells} cells at column {wall_col} (wall cells)")
     log(f"River source: {river_cells} cells at row {falls_row}, col {falls_col}")
 
     # Virtual flow gauges - measure velocity and depth at key locations
@@ -688,6 +809,14 @@ def run_tidal_cycle(river_flow: float = 1.0, tracer_diffusion: float = 0.5, dura
     for g in gauges:
         g["x"], g["y"] = gauge_transformer.transform(g["lon"], g["lat"])
     log(f"Flow gauges: {[g['name'] for g in gauges]}")
+
+    # Initialize kayak position - 5m southwest of boat ramp (into the water)
+    boat_ramp_x, boat_ramp_y = gauge_transformer.transform(BOAT_RAMP_LON, BOAT_RAMP_LAT)
+    kayak_x = boat_ramp_x - 5.0  # 5m west
+    kayak_y = boat_ramp_y - 5.0  # 5m south
+    kayak_heading = 225.0  # Facing southwest initially
+    log(f"Kayak start: 5m SW of boat ramp at ({kayak_x:.0f}, {kayak_y:.0f})")
+    log(f"Boat ramp at ({boat_ramp_x:.0f}, {boat_ramp_y:.0f})")
 
     log(f"Tide range: {low_tide}m to {high_tide}m")
     log(f"Wall at column {wall_col}")
@@ -794,7 +923,9 @@ def run_tidal_cycle(river_flow: float = 1.0, tracer_diffusion: float = 0.5, dura
     plt.close(fig_test)
 
     # Start ffmpeg process - stream PNG frames via stdin
-    video_path = "tidal_cycle.mp4"
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    video_path = f"waitangi_tidal_{timestamp}.mp4"
     log(f"\nStarting ffmpeg (streaming to {video_path})...")
     try:
         ffmpeg_proc = subprocess.Popen([
@@ -839,6 +970,19 @@ def run_tidal_cycle(river_flow: float = 1.0, tracer_diffusion: float = 0.5, dura
             river_mask, tide_level + 1.0, river_dh,
             ocean_inlet_mask
         )
+
+        # Advect kayak with water velocity
+        u_np_kayak = np.array(u)
+        v_np_kayak = np.array(v)
+        kayak_x, kayak_y = advect_kayak(
+            kayak_x, kayak_y, u_np_kayak, v_np_kayak,
+            extent, ny, nx, dt
+        )
+        # Update heading based on velocity direction
+        u_vel, v_vel = interpolate_velocity(kayak_x, kayak_y, u_np_kayak, v_np_kayak, extent, ny, nx)
+        if u_vel**2 + v_vel**2 > 0.001:
+            # Convert velocity to compass heading (0=N, 90=E)
+            kayak_heading = (90 - np.degrees(np.arctan2(v_vel, u_vel))) % 360
 
         # Render and stream frame
         if step % steps_per_output == 0:
@@ -893,10 +1037,36 @@ def run_tidal_cycle(river_flow: float = 1.0, tracer_diffusion: float = 0.5, dura
             # Set alpha to 0 for dry cells
             rgba[:, :, 3] = np.where(wet, 0.85, 0.0)
 
-            ax.imshow(rgba, origin='upper', extent=extent)
+            ax.imshow(rgba, origin='upper', extent=extent, zorder=1)
+
+            # Add subtle velocity arrows (quiver plot) - only where water is moving
+            # Subsample for clarity (every 10th point in each direction)
+            skip = 10
+            u_display = u_np[::skip, ::skip]
+            v_display = v_np[::skip, ::skip]
+            h_sub = h[::skip, ::skip]
+
+            # Create coordinate grids for the subsampled data
+            x_coords = np.linspace(extent[0], extent[1], nx)[::skip]
+            y_coords = np.linspace(extent[3], extent[2], ny)[::skip]  # Flip y for upper origin
+            X, Y = np.meshgrid(x_coords, y_coords)
+
+            # Only show arrows where water is present and moving
+            speed = np.sqrt(u_display**2 + v_display**2)
+            mask = (h_sub > 0.03) & (speed > 0.002)
+
+            # Debug: check if we have any points
+            log(f"Quiver debug: {mask.sum()} points, max speed={speed.max():.4f} m/s, max h={h_sub.max():.2f}m")
+
+            # Subtle white arrows
+            # Note: v is negated because image has origin='upper' (y-axis flipped)
+            if mask.sum() > 0:
+                ax.quiver(X[mask], Y[mask], u_display[mask], -v_display[mask],
+                          color='white', alpha=0.4, scale=50, width=0.002,
+                          headwidth=4, headlength=5, zorder=3)
 
             # Plot gauge markers
-            marker_colors = ['white', 'cyan', 'lime']
+            marker_colors = ['white', 'cyan', 'yellow']
             for gi, g in enumerate(gauges):
                 ax.plot(g["x"], g["y"], 'o', color=marker_colors[gi], markersize=10,
                         markeredgecolor='black', markeredgewidth=1.5)
@@ -906,6 +1076,22 @@ def run_tidal_cycle(river_flow: float = 1.0, tracer_diffusion: float = 0.5, dura
                                 plt.matplotlib.patheffects.withStroke(linewidth=2, foreground='black')
                             ])
 
+            # Draw kayak as rotated diamond shape based on heading
+            # kayak_heading is in degrees, 0=East, 90=North
+            heading_rad = np.radians(kayak_heading)
+            # Diamond vertices: front, right, back, left (relative to heading)
+            # Scale for visibility (kayak is 3.9m long, 0.81m wide - scale up for display)
+            scale = 25  # meters in display
+            front = (kayak_x + scale * np.cos(heading_rad), kayak_y + scale * np.sin(heading_rad))
+            back = (kayak_x - scale * 0.5 * np.cos(heading_rad), kayak_y - scale * 0.5 * np.sin(heading_rad))
+            right = (kayak_x + scale * 0.3 * np.cos(heading_rad - np.pi/2),
+                     kayak_y + scale * 0.3 * np.sin(heading_rad - np.pi/2))
+            left = (kayak_x + scale * 0.3 * np.cos(heading_rad + np.pi/2),
+                    kayak_y + scale * 0.3 * np.sin(heading_rad + np.pi/2))
+            kayak_verts_x = [front[0], right[0], back[0], left[0], front[0]]
+            kayak_verts_y = [front[1], right[1], back[1], left[1], front[1]]
+            ax.fill(kayak_verts_x, kayak_verts_y, color='lime', edgecolor='black', linewidth=2, zorder=10)
+
             # Custom legend for water source colors
             from matplotlib.patches import Patch
             legend_elements = [
@@ -913,6 +1099,7 @@ def run_tidal_cycle(river_flow: float = 1.0, tracer_diffusion: float = 0.5, dura
                 Patch(facecolor=(1.0, 0.1, 0.1), edgecolor='black', label='Ocean (red)'),
                 Patch(facecolor=(1.0, 0.5, 0.05), edgecolor='black', label='Mixed (orange)'),
                 Patch(facecolor=(0.2, 0.5, 0.9), edgecolor='black', label='Neutral (blue)'),
+                Patch(facecolor='lime', edgecolor='black', label='Kayak'),
             ]
             ax.legend(handles=legend_elements, loc='upper right', fontsize=9)
 

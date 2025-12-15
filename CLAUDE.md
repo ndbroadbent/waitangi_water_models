@@ -4,6 +4,29 @@
 
 GPU-accelerated 2D shallow water simulation for the Waitangi River estuary (Bay of Islands, New Zealand). Models tidal flow, river mixing, and kayak conditions.
 
+## Project Structure
+
+```
+waitangi_water_models/
+├── src/waitangi/
+│   ├── data/
+│   │   ├── elevation.py          # Fetches LINZ LiDAR DEM from cloud
+│   │   ├── estuary_geometry.py   # Bounding boxes, visualization areas
+│   │   ├── nrc_hilltop.py        # NRC river flow API client
+│   │   └── reference_points.py   # Ground-truth coordinates
+│   └── core/
+│       └── config.py             # WaitangiLocation constants, CRS definitions
+├── scripts/
+│   ├── tidal_cycle_simulation.py # Main JAX/GPU simulation
+│   ├── plot_river_data.py        # Fetch/plot NRC gauge data
+│   └── generate_mangrove_polygon.py
+├── tests/
+├── pyproject.toml                # uv/pip dependencies
+└── CLAUDE.md                     # This file
+```
+
+**Note:** There is no local `data/` directory - elevation data is fetched from LINZ cloud on first run and cached to disk at `~/.cache/waitangi_water_models/`.
+
 ## Key Data Sources
 
 ### River Flow Data
@@ -27,9 +50,13 @@ GPU-accelerated 2D shallow water simulation for the Waitangi River estuary (Bay 
 - **Manning's n:** Use ~0.12-0.15 for mangroves (vs 0.035 for open water)
 
 ### Elevation Data
-- **Source:** LINZ LiDAR DEM (1m resolution)
-- **Fetched via:** `waitangi.data.elevation.fetch_waitangi_elevation()`
+- **Source:** LINZ LiDAR DEM (1m resolution) - Cloud-Optimized GeoTIFFs
+- **URL:** `https://nz-elevation.s3.ap-southeast-2.amazonaws.com/new-zealand/new-zealand/dem_1m/2193/AV29.tiff`
+- **Fetched via:** `waitangi.data.elevation.fetch_waitangi_elevation()` (in `src/waitangi/data/elevation.py`)
 - **Coordinate system:** NZTM2000 (EPSG:2193)
+- **Grid bounds (NZTM):** west=1695441, south=6094774, east=1698716, north=6097323
+- **Raw shape:** 2549 x 3275 at 1m resolution
+- **Downsampled:** 8x to 319 x 410 at 8m resolution
 
 ### Tidal Parameters
 - **Range:** -0.5m to +1.1m (1.6m total)
