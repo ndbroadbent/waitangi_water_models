@@ -40,6 +40,7 @@ dependencies = [
     "contextily>=1.7.0",
     "scikit-image>=0.25.2",
     "rioxarray>=0.19.0",
+    "astronomix>=0.5.1",
 ]
 
 [project.optional-dependencies]

@@ -37,6 +37,7 @@ from waitangi.pipeline.data import (
     KayakState,
     SimulationConfig,
 )
+from waitangi.pipeline.riemann import hll_shallow_water_flux_2d
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -102,10 +103,10 @@ def _interpolate_velocity(
 
 
 @jit
-def _simulation_step(
-    eta,
-    u,
-    v,
+def _simulation_step_hll(
+    h,
+    hu,
+    hv,
     river_mass,
     ocean_mass,
     z_bed,
@@ -115,173 +116,189 @@ def _simulation_step(
     ocean_inlet_mask,
     tracer_diffusion: float = 5.0,
 ):
-    """Single simulation timestep - JIT compiled for GPU.
+    """Single simulation timestep using HLL Riemann solver.
 
-    Uses unified mass advection: tracer mass (tracer * h) is advected alongside
-    water, ensuring tracers stay coupled to the water that carries them.
-    This correctly handles wetting fronts without special cases.
+    Uses conserved variables (h, hu, hv) and HLL flux computation for
+    accurate shock/wave propagation and robust wetting/drying.
+
+    Tracer mass is advected alongside water mass for correct coupling.
     """
     dx, dy, dt, g, max_vel = params
 
-    h = jnp.maximum(eta - z_bed, 0.0)
+    # Ensure non-negative depth
+    h = jnp.maximum(h, 0.0)
 
-    # CRITICAL: At source boundaries, ensure mass = h (concentration = 1.0)
-    # This must happen BEFORE computing concentrations for advection
-    # so that water flowing FROM source cells carries the correct tracer
+    # CRITICAL: At source boundaries, ensure tracer mass = h (concentration = 1.0)
     river_mass = jnp.where(river_mask & (h > 0.01), h, river_mass)
     ocean_mass = jnp.where(ocean_inlet_mask & (h > 0.01), h, ocean_mass)
 
-    # Momentum equations (unchanged)
-    deta_dx = jnp.zeros_like(eta)
-    deta_dx = deta_dx.at[:-1, :].set((eta[1:, :] - eta[:-1, :]) / dx)
+    # Compute HLL fluxes at cell interfaces
+    flux_x, flux_y = hll_shallow_water_flux_2d(h, hu, hv, g, dx, dy)
+    flux_h_x, flux_hu_x, flux_hv_x = flux_x
+    flux_h_y, flux_hu_y, flux_hv_y = flux_y
 
-    deta_dy = jnp.zeros_like(eta)
-    deta_dy = deta_dy.at[:, :-1].set((eta[:, 1:] - eta[:, :-1]) / dy)
-
-    u = u.at[:-1, :].add(-g * dt * deta_dx[:-1, :])
-    v = v.at[:, :-1].add(-g * dt * deta_dy[:, :-1])
-
-    h_at_u = jnp.maximum((h[:-1, :] + h[1:, :]) / 2, 0.01)
-    h_at_v = jnp.maximum((h[:, :-1] + h[:, 1:]) / 2, 0.01)
-
-    manning_at_u = (manning_field[:-1, :] + manning_field[1:, :]) / 2
-    manning_at_v = (manning_field[:, :-1] + manning_field[:, 1:]) / 2
-
-    Cf_u = g * manning_at_u**2 / jnp.power(h_at_u, 1 / 3)
-    Cf_v = g * manning_at_v**2 / jnp.power(h_at_v, 1 / 3)
-
-    friction_u = 1.0 / (1.0 + dt * Cf_u * jnp.abs(u[:-1, :]) / h_at_u)
-    friction_v = 1.0 / (1.0 + dt * Cf_v * jnp.abs(v[:, :-1]) / h_at_v)
-
-    u = u.at[:-1, :].multiply(friction_u)
-    v = v.at[:, :-1].multiply(friction_v)
-
-    u = jnp.clip(u, -max_vel, max_vel)
-    v = jnp.clip(v, -max_vel, max_vel)
-
-    u = u.at[-1, :].set(0.0)
-    u = u.at[0, :].set(0.0)
-    v = v.at[:, -1].set(0.0)
-    v = v.at[:, 0].set(0.0)
-
-    # Upwind water depth at cell faces
-    h_e = jnp.where(u[:-1, :] > 0, h[:-1, :], h[1:, :])
-    h_n = jnp.where(v[:, :-1] > 0, h[:, :-1], h[:, 1:])
-
-    # Water flux through faces
-    flux_e = u[:-1, :] * h_e
-    flux_n = v[:, :-1] * h_n
-
-    # Tracer CONCENTRATION at each cell (mass / depth)
-    # For dry cells (h=0), concentration is undefined but mass is 0
+    # Tracer advection: compute tracer mass fluxes using same water flux
+    # Tracer concentration = mass / depth
     h_safe = jnp.maximum(h, 1e-10)
     river_conc = river_mass / h_safe
     ocean_conc = ocean_mass / h_safe
+    river_conc = jnp.where(h > 1e-6, river_conc, 0.0)
+    ocean_conc = jnp.where(h > 1e-6, ocean_conc, 0.0)
 
-    # Upwind tracer concentrations at faces
-    river_conc_e = jnp.where(u[:-1, :] > 0, river_conc[:-1, :], river_conc[1:, :])
-    river_conc_n = jnp.where(v[:, :-1] > 0, river_conc[:, :-1], river_conc[:, 1:])
-    ocean_conc_e = jnp.where(u[:-1, :] > 0, ocean_conc[:-1, :], ocean_conc[1:, :])
-    ocean_conc_n = jnp.where(v[:, :-1] > 0, ocean_conc[:, :-1], ocean_conc[:, 1:])
+    # Upwind tracer concentrations at faces (using sign of mass flux)
+    river_conc_e = jnp.where(flux_h_x > 0, river_conc[:-1, :], river_conc[1:, :])
+    river_conc_n = jnp.where(flux_h_y > 0, river_conc[:, :-1], river_conc[:, 1:])
+    ocean_conc_e = jnp.where(flux_h_x > 0, ocean_conc[:-1, :], ocean_conc[1:, :])
+    ocean_conc_n = jnp.where(flux_h_y > 0, ocean_conc[:, :-1], ocean_conc[:, 1:])
 
-    # Tracer MASS flux = water flux * concentration
-    # This is the key: mass flux is coupled to water flux
-    river_flux_e = flux_e * river_conc_e
-    river_flux_n = flux_n * river_conc_n
-    ocean_flux_e = flux_e * ocean_conc_e
-    ocean_flux_n = flux_n * ocean_conc_n
+    # Tracer mass flux = water mass flux * concentration
+    river_flux_e = flux_h_x * river_conc_e
+    river_flux_n = flux_h_y * river_conc_n
+    ocean_flux_e = flux_h_x * ocean_conc_e
+    ocean_flux_n = flux_h_y * ocean_conc_n
 
-    # Divergence of water flux
-    div = jnp.zeros_like(eta)
-    div = div.at[:-1, :].add(flux_e / dx)
-    div = div.at[1:, :].add(-flux_e / dx)
-    div = div.at[:, :-1].add(flux_n / dy)
-    div = div.at[:, 1:].add(-flux_n / dy)
+    # Divergence of water mass flux
+    div_h = jnp.zeros_like(h)
+    div_h = div_h.at[:-1, :].add(flux_h_x / dx)
+    div_h = div_h.at[1:, :].add(-flux_h_x / dx)
+    div_h = div_h.at[:, :-1].add(flux_h_y / dy)
+    div_h = div_h.at[:, 1:].add(-flux_h_y / dy)
 
-    # Divergence of tracer mass flux (same pattern as water)
-    div_river = jnp.zeros_like(eta)
+    # Divergence of x-momentum flux
+    div_hu = jnp.zeros_like(h)
+    div_hu = div_hu.at[:-1, :].add(flux_hu_x / dx)
+    div_hu = div_hu.at[1:, :].add(-flux_hu_x / dx)
+    div_hu = div_hu.at[:, :-1].add(flux_hu_y / dy)
+    div_hu = div_hu.at[:, 1:].add(-flux_hu_y / dy)
+
+    # Divergence of y-momentum flux
+    div_hv = jnp.zeros_like(h)
+    div_hv = div_hv.at[:-1, :].add(flux_hv_x / dx)
+    div_hv = div_hv.at[1:, :].add(-flux_hv_x / dx)
+    div_hv = div_hv.at[:, :-1].add(flux_hv_y / dy)
+    div_hv = div_hv.at[:, 1:].add(-flux_hv_y / dy)
+
+    # Divergence of tracer mass fluxes
+    div_river = jnp.zeros_like(h)
     div_river = div_river.at[:-1, :].add(river_flux_e / dx)
     div_river = div_river.at[1:, :].add(-river_flux_e / dx)
     div_river = div_river.at[:, :-1].add(river_flux_n / dy)
     div_river = div_river.at[:, 1:].add(-river_flux_n / dy)
 
-    div_ocean = jnp.zeros_like(eta)
+    div_ocean = jnp.zeros_like(h)
     div_ocean = div_ocean.at[:-1, :].add(ocean_flux_e / dx)
     div_ocean = div_ocean.at[1:, :].add(-ocean_flux_e / dx)
     div_ocean = div_ocean.at[:, :-1].add(ocean_flux_n / dy)
     div_ocean = div_ocean.at[:, 1:].add(-ocean_flux_n / dy)
 
-    # Update water level
-    eta = eta - dt * div
-    eta = jnp.maximum(eta, z_bed)
-    h_new = jnp.maximum(eta - z_bed, 0.0)
+    # Update conserved variables
+    h_new = h - dt * div_h
+    hu_new = hu - dt * div_hu
+    hv_new = hv - dt * div_hv
 
-    # Update tracer MASS (not concentration!)
+    # Enforce positivity of depth
+    h_new = jnp.maximum(h_new, 0.0)
+
+    # Bed slope source term: S_b = -gh * ∂z/∂x, -gh * ∂z/∂y
+    dz_dx = jnp.zeros_like(z_bed)
+    dz_dy = jnp.zeros_like(z_bed)
+    dz_dx = dz_dx.at[1:-1, :].set((z_bed[2:, :] - z_bed[:-2, :]) / (2 * dx))
+    dz_dy = dz_dy.at[:, 1:-1].set((z_bed[:, 2:] - z_bed[:, :-2]) / (2 * dy))
+
+    hu_new = hu_new - dt * g * h_new * dz_dx
+    hv_new = hv_new - dt * g * h_new * dz_dy
+
+    # Semi-implicit friction for stability
+    h_safe_new = jnp.maximum(h_new, 1e-6)
+    u_new = hu_new / h_safe_new
+    v_new = hv_new / h_safe_new
+    speed = jnp.sqrt(u_new**2 + v_new**2)
+
+    Cf = g * manning_field**2 / jnp.power(h_safe_new, 1.0 / 3.0)
+    friction_denom = 1.0 + dt * Cf * speed / h_safe_new
+
+    hu_new = hu_new / friction_denom
+    hv_new = hv_new / friction_denom
+
+    # Velocity limiting
+    u_new = hu_new / h_safe_new
+    v_new = hv_new / h_safe_new
+    u_new = jnp.clip(u_new, -max_vel, max_vel)
+    v_new = jnp.clip(v_new, -max_vel, max_vel)
+    hu_new = h_new * u_new
+    hv_new = h_new * v_new
+
+    # Zero momentum in dry cells
+    hu_new = jnp.where(h_new > 1e-6, hu_new, 0.0)
+    hv_new = jnp.where(h_new > 1e-6, hv_new, 0.0)
+
+    # Update tracer mass
     river_mass = river_mass - dt * div_river
     ocean_mass = ocean_mass - dt * div_ocean
 
-    # Clip mass to physical bounds (can't be negative, can't exceed water depth)
+    # Clip tracer mass to physical bounds
     river_mass = jnp.clip(river_mass, 0.0, h_new)
     ocean_mass = jnp.clip(ocean_mass, 0.0, h_new)
 
-    # Diffusion (operates on concentration, only between wet cells)
     wet = h_new > 0.01
     h_new_safe = jnp.maximum(h_new, 1e-10)
-    river_conc_new = river_mass / h_new_safe
-    ocean_conc_new = ocean_mass / h_new_safe
 
-    # For diffusion, treat dry cells as having the same concentration as their wet neighbors
-    # This prevents diffusion into dry cells from diluting the tracer
-    # We use the cell's own concentration for dry neighbors
-    wet_padded = jnp.pad(wet, 1, mode="constant", constant_values=False)
+    # Diffusion on tracer MASS (not concentration), only between wet-wet connections
+    if tracer_diffusion > 0:
+        wet_padded = jnp.pad(wet, 1, mode="constant", constant_values=False)
+        river_padded = jnp.pad(river_mass, 1, mode="constant", constant_values=0.0)
+        ocean_padded = jnp.pad(ocean_mass, 1, mode="constant", constant_values=0.0)
 
-    river_padded = jnp.pad(river_conc_new, 1, mode="constant", constant_values=0.0)
-    ocean_padded = jnp.pad(ocean_conc_new, 1, mode="constant", constant_values=0.0)
+        # For diffusion, only exchange mass between wet cells
+        # Use mass directly, not concentration
+        wet_north = wet_padded[:-2, 1:-1]
+        wet_south = wet_padded[2:, 1:-1]
+        wet_west = wet_padded[1:-1, :-2]
+        wet_east = wet_padded[1:-1, 2:]
 
-    # For each neighbor direction, use neighbor value if wet, else use center value (no flux)
-    river_north = jnp.where(wet_padded[:-2, 1:-1], river_padded[:-2, 1:-1], river_conc_new)
-    river_south = jnp.where(wet_padded[2:, 1:-1], river_padded[2:, 1:-1], river_conc_new)
-    river_west = jnp.where(wet_padded[1:-1, :-2], river_padded[1:-1, :-2], river_conc_new)
-    river_east = jnp.where(wet_padded[1:-1, 2:], river_padded[1:-1, 2:], river_conc_new)
+        river_north = jnp.where(wet_north, river_padded[:-2, 1:-1], river_mass)
+        river_south = jnp.where(wet_south, river_padded[2:, 1:-1], river_mass)
+        river_west = jnp.where(wet_west, river_padded[1:-1, :-2], river_mass)
+        river_east = jnp.where(wet_east, river_padded[1:-1, 2:], river_mass)
 
-    ocean_north = jnp.where(wet_padded[:-2, 1:-1], ocean_padded[:-2, 1:-1], ocean_conc_new)
-    ocean_south = jnp.where(wet_padded[2:, 1:-1], ocean_padded[2:, 1:-1], ocean_conc_new)
-    ocean_west = jnp.where(wet_padded[1:-1, :-2], ocean_padded[1:-1, :-2], ocean_conc_new)
-    ocean_east = jnp.where(wet_padded[1:-1, 2:], ocean_padded[1:-1, 2:], ocean_conc_new)
+        ocean_north = jnp.where(wet_north, ocean_padded[:-2, 1:-1], ocean_mass)
+        ocean_south = jnp.where(wet_south, ocean_padded[2:, 1:-1], ocean_mass)
+        ocean_west = jnp.where(wet_west, ocean_padded[1:-1, :-2], ocean_mass)
+        ocean_east = jnp.where(wet_east, ocean_padded[1:-1, 2:], ocean_mass)
 
-    lap_river = (river_north + river_south + river_west + river_east - 4 * river_conc_new) / (dx * dy)
-    lap_ocean = (ocean_north + ocean_south + ocean_west + ocean_east - 4 * ocean_conc_new) / (dx * dy)
+        lap_river = (river_north + river_south + river_west + river_east - 4 * river_mass) / (dx * dy)
+        lap_ocean = (ocean_north + ocean_south + ocean_west + ocean_east - 4 * ocean_mass) / (dx * dy)
 
-    river_conc_new = river_conc_new + tracer_diffusion * dt * lap_river
-    ocean_conc_new = ocean_conc_new + tracer_diffusion * dt * lap_ocean
+        river_mass = river_mass + tracer_diffusion * dt * lap_river
+        ocean_mass = ocean_mass + tracer_diffusion * dt * lap_ocean
 
-    # Clip concentrations and convert back to mass
-    river_conc_new = jnp.clip(river_conc_new, 0.0, 1.0)
-    ocean_conc_new = jnp.clip(ocean_conc_new, 0.0, 1.0)
-    river_mass = river_conc_new * h_new
-    ocean_mass = ocean_conc_new * h_new
+        river_mass = jnp.clip(river_mass, 0.0, h_new)
+        ocean_mass = jnp.clip(ocean_mass, 0.0, h_new)
+
+    # Enforce partition of water: river_mass + ocean_mass == h in wet cells
+    # This ensures tracers stay consistent with water mass even with numerical diffusion
+    total_tracer = river_mass + ocean_mass
+    eps = 1e-10
+    scale = jnp.where(
+        (h_new > eps) & (total_tracer > eps),
+        h_new / total_tracer,
+        1.0
+    )
+    river_mass = river_mass * scale
+    ocean_mass = ocean_mass * scale
 
     # Zero out mass in dry cells
     river_mass = jnp.where(wet, river_mass, 0.0)
     ocean_mass = jnp.where(wet, ocean_mass, 0.0)
 
-    return eta, u, v, river_mass, ocean_mass
+    return h_new, hu_new, hv_new, river_mass, ocean_mass
 
 
 @jit
-def _apply_boundary_conditions_hydro(eta, u, v, z_bed, dam_mask, dam_level, river_mask, river_level, river_dh):
-    """Apply hydrodynamic boundary conditions only."""
-    eta = jnp.where(dam_mask, dam_level, eta)
-    eta = jnp.where(river_mask, eta + river_dh, eta)
-    eta = jnp.where(river_mask, jnp.maximum(eta, river_level), eta)
-    return eta, u, v
-
-
-@jit
-def _apply_boundary_conditions_full(
-    eta,
-    u,
-    v,
+def _apply_boundary_conditions_hll(
+    h,
+    hu,
+    hv,
     river_mass,
     ocean_mass,
     z_bed,
@@ -292,23 +309,54 @@ def _apply_boundary_conditions_full(
     river_dh,
     ocean_inlet_mask,
 ):
-    """Apply full boundary conditions including tracer mass injection.
+    """Apply boundary conditions for HLL solver using conserved variables.
 
     At source boundaries, we set tracer MASS = h (i.e., concentration = 1.0).
-    This ensures water entering from sources is fully tagged.
     """
-    eta = jnp.where(dam_mask, dam_level, eta)
-    eta = jnp.where(river_mask, eta + river_dh, eta)
-    eta = jnp.where(river_mask, jnp.maximum(eta, river_level), eta)
+    # Dam/tide boundary: set water surface to dam_level
+    h_dam = jnp.maximum(dam_level - z_bed, 0.0)
+    h = jnp.where(dam_mask, h_dam, h)
+    # Zero momentum at dam boundary (water level is prescribed)
+    hu = jnp.where(dam_mask, 0.0, hu)
+    hv = jnp.where(dam_mask, 0.0, hv)
 
-    h = jnp.maximum(eta - z_bed, 0.0)
+    # River inflow: add water height and ensure minimum level
+    h = jnp.where(river_mask, h + river_dh, h)
+    h_river_min = jnp.maximum(river_level - z_bed, 0.0)
+    h = jnp.where(river_mask, jnp.maximum(h, h_river_min), h)
+
     wet = h > 0.01
 
     # At source cells: mass = h means concentration = 1.0
     river_mass = jnp.where(river_mask & wet, h, river_mass)
     ocean_mass = jnp.where(ocean_inlet_mask & wet, h, ocean_mass)
 
-    return eta, u, v, river_mass, ocean_mass
+    return h, hu, hv, river_mass, ocean_mass
+
+
+@jit
+def _apply_boundary_conditions_hll_hydro_only(
+    h,
+    hu,
+    hv,
+    z_bed,
+    dam_mask,
+    dam_level,
+    river_mask,
+    river_level,
+    river_dh,
+):
+    """Apply hydrodynamic boundary conditions only (for equilibration phase)."""
+    h_dam = jnp.maximum(dam_level - z_bed, 0.0)
+    h = jnp.where(dam_mask, h_dam, h)
+    hu = jnp.where(dam_mask, 0.0, hu)
+    hv = jnp.where(dam_mask, 0.0, hv)
+
+    h = jnp.where(river_mask, h + river_dh, h)
+    h_river_min = jnp.maximum(river_level - z_bed, 0.0)
+    h = jnp.where(river_mask, jnp.maximum(h, h_river_min), h)
+
+    return h, hu, hv
 
 
 class SimulationEngine:
@@ -473,7 +521,9 @@ class SimulationEngine:
         self.log(f"Timestep: {self.dt:.3f}s")
 
     def _run_simulation(self, stop_at_frame: int | None = None):
-        """Main simulation loop - runs in a separate thread.
+        """Main simulation loop using HLL Riemann solver.
+
+        Uses conserved variables (h, hu, hv) for accurate shock/wave propagation.
 
         Args:
             stop_at_frame: If set, stop after outputting this frame number (0-indexed).
@@ -501,36 +551,35 @@ class SimulationEngine:
         river_area = np.sum(self.river_mask_np) * dx * dy
         river_dh = cfg.river_flow * dt / river_area if river_area > 0 else 0.0
 
-        # Initialize water level
-        # If skip_equilibrium: start completely dry (eta = z_bed, so h = 0 everywhere)
+        # Initialize using conserved variables (h, hu, hv)
+        # If skip_equilibrium: start completely dry (h = 0 everywhere)
         # Otherwise: start at low tide and let it equilibrate
         if cfg.skip_equilibrium:
             self.log("\nStarting dry (skip_equilibrium)...")
-            eta_np = self.z_bed_np.copy()
+            h_np = np.zeros((self.ny, self.nx), dtype=np.float32)
         else:
             init_level = cfg.low_tide
             self.log(f"\nInitializing at low tide ({init_level}m)...")
-            eta_np = np.where(self.z_bed_np < init_level, init_level, self.z_bed_np)
-            eta_np[self.wall_mask_np] = init_level
+            h_np = np.maximum(init_level - self.z_bed_np, 0.0).astype(np.float32)
+            h_np[self.wall_mask_np] = np.maximum(init_level - self.z_bed_np[self.wall_mask_np], 0.0)
 
-        eta = jnp.array(eta_np)
-        u = jnp.zeros((self.ny, self.nx))
-        v = jnp.zeros((self.ny, self.nx))
-        # Track tracer MASS (= concentration * depth), not concentration
+        h = jnp.array(h_np)
+        hu = jnp.zeros((self.ny, self.nx))
+        hv = jnp.zeros((self.ny, self.nx))
         river_mass = jnp.zeros((self.ny, self.nx))
         ocean_mass = jnp.zeros((self.ny, self.nx))
 
         empty_mask = jnp.zeros((self.ny, self.nx), dtype=bool)
 
-        # Warm up JIT
-        self.log("Warming up JIT...")
-        eta, u, v, river_mass, ocean_mass = _simulation_step(
-            eta, u, v, river_mass, ocean_mass, z_bed, manning_field, params, empty_mask, empty_mask, cfg.tracer_diffusion
+        # Warm up JIT (HLL solver)
+        self.log("Warming up JIT (HLL solver)...")
+        h, hu, hv, river_mass, ocean_mass = _simulation_step_hll(
+            h, hu, hv, river_mass, ocean_mass, z_bed, manning_field, params, empty_mask, empty_mask, cfg.tracer_diffusion
         )
-        eta, u, v = _apply_boundary_conditions_hydro(
-            eta, u, v, z_bed, wall_mask, cfg.low_tide, river_mask, cfg.low_tide + 1.0, river_dh
+        h, hu, hv = _apply_boundary_conditions_hll_hydro_only(
+            h, hu, hv, z_bed, wall_mask, cfg.low_tide, river_mask, cfg.low_tide + 1.0, river_dh
         )
-        jax.block_until_ready(eta)
+        jax.block_until_ready(h)
 
         # Equilibration (can be skipped)
         if cfg.skip_equilibrium:
@@ -538,11 +587,11 @@ class SimulationEngine:
         else:
             self.log("Equilibrating at low tide...")
             for _ in range(2000):
-                eta, u, v, river_mass, ocean_mass = _simulation_step(
-                    eta, u, v, river_mass, ocean_mass, z_bed, manning_field, params, empty_mask, empty_mask, cfg.tracer_diffusion
+                h, hu, hv, river_mass, ocean_mass = _simulation_step_hll(
+                    h, hu, hv, river_mass, ocean_mass, z_bed, manning_field, params, empty_mask, empty_mask, cfg.tracer_diffusion
                 )
-                eta, u, v = _apply_boundary_conditions_hydro(
-                    eta, u, v, z_bed, wall_mask, cfg.low_tide, river_mask, cfg.low_tide + 1.0, river_dh
+                h, hu, hv = _apply_boundary_conditions_hll_hydro_only(
+                    h, hu, hv, z_bed, wall_mask, cfg.low_tide, river_mask, cfg.low_tide + 1.0, river_dh
                 )
 
         # Reset tracer mass after equilibration
@@ -558,7 +607,7 @@ class SimulationEngine:
         steps_per_output = int(cfg.output_interval / dt)
         n_frames = n_steps // steps_per_output + 1
 
-        self.log(f"\nRunning tidal cycle...")
+        self.log(f"\nRunning tidal cycle (HLL solver)...")
         self.log(f"Duration: {duration/3600:.1f} hours ({n_steps} steps)")
         self.log(f"Output every {cfg.output_interval}s ({n_frames} frames)")
 
@@ -574,17 +623,23 @@ class SimulationEngine:
             else:
                 tide_level = cfg.mean_tide + cfg.tide_amplitude * np.sin(2 * np.pi * t / cfg.tide_period - np.pi / 2)
 
-            # Simulation step (using tracer mass, not concentration)
-            eta, u, v, river_mass, ocean_mass = _simulation_step(
-                eta, u, v, river_mass, ocean_mass, z_bed, manning_field, params, river_mask, ocean_inlet_mask, cfg.tracer_diffusion
+            # Simulation step using HLL Riemann solver
+            h, hu, hv, river_mass, ocean_mass = _simulation_step_hll(
+                h, hu, hv, river_mass, ocean_mass, z_bed, manning_field, params, river_mask, ocean_inlet_mask, cfg.tracer_diffusion
             )
-            eta, u, v, river_mass, ocean_mass = _apply_boundary_conditions_full(
-                eta, u, v, river_mass, ocean_mass, z_bed, wall_mask, tide_level, river_mask, tide_level + 1.0, river_dh, ocean_inlet_mask
+            h, hu, hv, river_mass, ocean_mass = _apply_boundary_conditions_hll(
+                h, hu, hv, river_mass, ocean_mass, z_bed, wall_mask, tide_level, river_mask, tide_level + 1.0, river_dh, ocean_inlet_mask
             )
 
+            # Compute velocities for kayak advection and output
+            h_np = np.array(h)
+            hu_np = np.array(hu)
+            hv_np = np.array(hv)
+            h_safe = np.maximum(h_np, 1e-6)
+            u_np = np.where(h_np > 1e-6, hu_np / h_safe, 0.0)
+            v_np = np.where(h_np > 1e-6, hv_np / h_safe, 0.0)
+
             # Advect kayak
-            u_np = np.array(u)
-            v_np = np.array(v)
             u_vel, v_vel = _interpolate_velocity(self.kayak_x, self.kayak_y, u_np, v_np, self.extent, self.ny, self.nx)
             self.kayak_x += u_vel * dt
             self.kayak_y += v_vel * dt
@@ -593,29 +648,24 @@ class SimulationEngine:
 
             # Output frame
             if step % steps_per_output == 0:
-                jax.block_until_ready(eta)
-
-                eta_np = np.array(eta)
-                h = np.maximum(eta_np - self.z_bed_np, 0)
+                jax.block_until_ready(h)
 
                 # Convert tracer mass to concentration for output
-                # concentration = mass / depth (where depth > 0)
                 river_mass_np = np.array(river_mass)
                 ocean_mass_np = np.array(ocean_mass)
-                h_safe = np.maximum(h, 1e-10)
-                river_tracer_np = np.where(h > 0.01, river_mass_np / h_safe, 0.0)
-                ocean_tracer_np = np.where(h > 0.01, ocean_mass_np / h_safe, 0.0)
-                # Clip to valid range
+                h_safe_out = np.maximum(h_np, 1e-10)
+                river_tracer_np = np.where(h_np > 0.01, river_mass_np / h_safe_out, 0.0)
+                ocean_tracer_np = np.where(h_np > 0.01, ocean_mass_np / h_safe_out, 0.0)
                 river_tracer_np = np.clip(river_tracer_np, 0.0, 1.0)
                 ocean_tracer_np = np.clip(ocean_tracer_np, 0.0, 1.0)
 
-                wet_area_km2 = np.sum(h > 0.01) * dx * dy / 1e6
+                wet_area_km2 = np.sum(h_np > 0.01) * dx * dy / 1e6
 
                 # Collect gauge data
                 gauge_data = []
                 for g in self.gauges:
                     r, c = g["row"], g["col"]
-                    gh = h[r, c]
+                    gh = h_np[r, c]
                     gu = u_np[r, c]
                     gv = v_np[r, c]
                     speed = np.sqrt(gu**2 + gv**2)
@@ -638,7 +688,7 @@ class SimulationEngine:
                     total_frames=n_frames,
                     simulation_time=t,
                     tide_level=tide_level,
-                    h=h.copy(),
+                    h=h_np.copy(),
                     u=u_np.copy(),
                     v=v_np.copy(),
                     river_tracer=river_tracer_np.copy(),
