@@ -14,10 +14,18 @@ waitangi_water_models/
 │   │   ├── estuary_geometry.py   # Bounding boxes, visualization areas
 │   │   ├── nrc_hilltop.py        # NRC river flow API client
 │   │   └── reference_points.py   # Ground-truth coordinates
-│   └── core/
-│       └── config.py             # WaitangiLocation constants, CRS definitions
+│   ├── core/
+│   │   └── config.py             # WaitangiLocation constants, CRS definitions
+│   └── pipeline/                 # Parallel simulation pipeline
+│       ├── __init__.py
+│       ├── data.py               # Data classes (SimulationConfig, RenderConfig, FrameData)
+│       ├── pipeline.py           # Pipeline orchestrator
+│       ├── renderer.py           # Multi-threaded matplotlib frame renderer
+│       ├── simulation.py         # JAX/GPU simulation engine
+│       └── video_writer.py       # FFmpeg video writer
 ├── scripts/
-│   ├── tidal_cycle_simulation.py # Main JAX/GPU simulation
+│   ├── simulate.py               # Main simulation CLI (parallel pipeline)
+│   ├── tidal_cycle_simulation.py # Legacy single-threaded simulation (deprecated)
 │   ├── plot_river_data.py        # Fetch/plot NRC gauge data
 │   └── generate_mangrove_polygon.py
 ├── tests/
@@ -91,11 +99,25 @@ This explains why river water (green tracer) pools near Haruru Falls - the estua
 
 | Script | Purpose |
 |--------|---------|
-| `scripts/tidal_cycle_simulation.py` | Main JAX/GPU tidal simulation |
-| `scripts/tidal_cycle_simulation.py test` | Quick equilibrium test |
+| `scripts/simulate.py` | Main simulation CLI (parallel pipeline) |
 | `scripts/plot_river_data.py --days N` | Fetch and plot NRC gauge data |
 | `scripts/generate_mangrove_polygon.py` | Generate mangrove zone geojson |
-| `scripts/simple_tidal_test.py` | Earlier NumPy-based test |
+
+### simulate.py CLI Options
+
+```bash
+uv run python scripts/simulate.py [OPTIONS]
+
+Options:
+  --river-flow FLOAT      River flow rate in m³/s (default: 1.0, use 15.0 for heavy rain)
+  --duration FLOAT        Simulation duration in hours (default: full tidal cycle ~12.4h)
+  --no-diffusion          Disable tracer diffusion (permanent dye tracking)
+  --diffusion FLOAT       Tracer diffusion coefficient (default: 0.5)
+  --skip-equilibrium      Skip the initial equilibration phase
+  --fixed-tide FLOAT      Fixed tide level (disables tidal cycle)
+  --workers INT           Number of render worker threads (default: 4)
+  --output PATH           Output video path (default: auto-generated timestamp)
+```
 
 ## Reference Points
 

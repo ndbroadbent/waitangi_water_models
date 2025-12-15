@@ -1062,8 +1062,8 @@ def run_tidal_cycle(river_flow: float = 1.0, tracer_diffusion: float = 0.5, dura
             # Note: v is negated because image has origin='upper' (y-axis flipped)
             if mask.sum() > 0:
                 ax.quiver(X[mask], Y[mask], u_display[mask], -v_display[mask],
-                          color='white', alpha=0.4, scale=50, width=0.002,
-                          headwidth=4, headlength=5, zorder=3)
+                          color='white', alpha=0.4, scale=50, scale_units='xy',
+                          width=0.003, headwidth=3, headlength=4, zorder=3)
 
             # Plot gauge markers
             marker_colors = ['white', 'cyan', 'yellow']
@@ -1176,6 +1176,10 @@ if __name__ == "__main__":
                         help="Tracer diffusion coefficient (default: 0.5, realistic for estuarine turbulence)")
     parser.add_argument("--duration", type=float, default=None,
                         help="Simulation duration in hours (default: full tidal cycle ~12.4h)")
+    parser.add_argument("--skip-equilibrium", action="store_true",
+                        help="Skip the initial equilibration phase")
+    parser.add_argument("--fixed-tide", type=float, default=None,
+                        help="Fixed tide level (disables tidal cycle)")
 
     args = parser.parse_args()
 
