@@ -4,12 +4,22 @@ Consumes rendered frames in order and writes them to video.
 Handles out-of-order frame arrival by buffering.
 """
 
+import logging
 import subprocess
+import sys
 import threading
 from datetime import datetime
 from queue import Queue
 
 from waitangi.pipeline.data import END_OF_STREAM, RenderConfig, RenderedFrame
+
+# Configure module logger
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
 
 class VideoWriter:
@@ -24,11 +34,11 @@ class VideoWriter:
         input_queue: Queue,
         config: RenderConfig,
         output_path: str | None = None,
-        log_fn=print,
+        log_fn=None,
     ):
         self.input_queue = input_queue
         self.config = config
-        self.log = log_fn
+        self.log = log_fn or logger.info
 
         # Generate output path if not provided
         if output_path is None:

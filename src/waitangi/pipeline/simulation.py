@@ -5,12 +5,23 @@ for the rendering pipeline.
 """
 
 import json
+import logging
+import sys
 import threading
 from pathlib import Path
 from queue import Queue
 from typing import TYPE_CHECKING
 
 import jax
+
+# Configure module logger with immediate flushing
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    handler.stream = sys.stdout
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 import jax.numpy as jnp
 import numpy as np
 from jax import jit
@@ -91,78 +102,12 @@ def _interpolate_velocity(
 
 
 @jit
-def _advect_tracer(
-    tracer, h, h_new, u, v, h_e, h_n, dx, dy, dt, tracer_diffusion, source_mask, source_value
-):
-    """Advect and diffuse a single tracer field."""
-    tracer = jnp.where(source_mask, source_value, tracer)
-
-    wet_old = h > 0.01
-    wet_new = h_new > 0.01
-
-    tracer_e = jnp.where(u[:-1, :] > 0, tracer[:-1, :], tracer[1:, :])
-    tracer_n = jnp.where(v[:, :-1] > 0, tracer[:, :-1], tracer[:, 1:])
-
-    tracer_flux_e = u[:-1, :] * h_e * tracer_e
-    tracer_flux_n = v[:, :-1] * h_n * tracer_n
-
-    tracer_div = jnp.zeros_like(tracer)
-    tracer_div = tracer_div.at[:-1, :].add(tracer_flux_e / dx)
-    tracer_div = tracer_div.at[1:, :].add(-tracer_flux_e / dx)
-    tracer_div = tracer_div.at[:, :-1].add(tracer_flux_n / dy)
-    tracer_div = tracer_div.at[:, 1:].add(-tracer_flux_n / dy)
-
-    h_safe = jnp.maximum(h_new, 0.01)
-
-    # Standard advection for cells that were already wet
-    tracer_advected = jnp.where(wet_new, (tracer * h - dt * tracer_div) / h_safe, 0.0)
-    tracer_advected = jnp.clip(tracer_advected, 0.0, 1.0)
-
-    # For newly wet cells (dry -> wet), inherit tracer from wet neighbors
-    # This ensures water spreading onto dry land carries its tracer
-    newly_wet = wet_new & ~wet_old
-    tracer_padded = jnp.pad(tracer, 1, mode="constant", constant_values=0.0)
-    wet_padded = jnp.pad(wet_old, 1, mode="constant", constant_values=False)
-
-    # Get tracer values from 4 neighbors
-    neighbor_tracer_sum = (
-        tracer_padded[:-2, 1:-1] + tracer_padded[2:, 1:-1] +
-        tracer_padded[1:-1, :-2] + tracer_padded[1:-1, 2:]
-    )
-    neighbor_wet_count = (
-        wet_padded[:-2, 1:-1].astype(jnp.float32) + wet_padded[2:, 1:-1].astype(jnp.float32) +
-        wet_padded[1:-1, :-2].astype(jnp.float32) + wet_padded[1:-1, 2:].astype(jnp.float32)
-    )
-    neighbor_tracer_avg = jnp.where(neighbor_wet_count > 0, neighbor_tracer_sum / neighbor_wet_count, 0.0)
-
-    # Use neighbor average for newly wet cells, advected value otherwise
-    tracer = jnp.where(newly_wet, neighbor_tracer_avg, tracer_advected)
-
-    # Diffusion
-    tracer_padded2 = jnp.pad(tracer, 1, mode="constant", constant_values=0.0)
-    lap = (
-        tracer_padded2[:-2, 1:-1]
-        + tracer_padded2[2:, 1:-1]
-        + tracer_padded2[1:-1, :-2]
-        + tracer_padded2[1:-1, 2:]
-        - 4 * tracer
-    ) / (dx * dy)
-    tracer = tracer + tracer_diffusion * dt * lap
-    tracer = jnp.clip(tracer, 0.0, 1.0)
-
-    tracer = jnp.where(wet_new, tracer, 0.0)
-    tracer = jnp.where(source_mask & wet_new, source_value, tracer)
-
-    return tracer
-
-
-@jit
 def _simulation_step(
     eta,
     u,
     v,
-    river_tracer,
-    ocean_tracer,
+    river_mass,
+    ocean_mass,
     z_bed,
     manning_field,
     params,
@@ -170,11 +115,23 @@ def _simulation_step(
     ocean_inlet_mask,
     tracer_diffusion: float = 5.0,
 ):
-    """Single simulation timestep - JIT compiled for GPU."""
+    """Single simulation timestep - JIT compiled for GPU.
+
+    Uses unified mass advection: tracer mass (tracer * h) is advected alongside
+    water, ensuring tracers stay coupled to the water that carries them.
+    This correctly handles wetting fronts without special cases.
+    """
     dx, dy, dt, g, max_vel = params
 
     h = jnp.maximum(eta - z_bed, 0.0)
 
+    # CRITICAL: At source boundaries, ensure mass = h (concentration = 1.0)
+    # This must happen BEFORE computing concentrations for advection
+    # so that water flowing FROM source cells carries the correct tracer
+    river_mass = jnp.where(river_mask & (h > 0.01), h, river_mass)
+    ocean_mass = jnp.where(ocean_inlet_mask & (h > 0.01), h, ocean_mass)
+
+    # Momentum equations (unchanged)
     deta_dx = jnp.zeros_like(eta)
     deta_dx = deta_dx.at[:-1, :].set((eta[1:, :] - eta[:-1, :]) / dx)
 
@@ -207,31 +164,108 @@ def _simulation_step(
     v = v.at[:, -1].set(0.0)
     v = v.at[:, 0].set(0.0)
 
+    # Upwind water depth at cell faces
     h_e = jnp.where(u[:-1, :] > 0, h[:-1, :], h[1:, :])
     h_n = jnp.where(v[:, :-1] > 0, h[:, :-1], h[:, 1:])
 
+    # Water flux through faces
     flux_e = u[:-1, :] * h_e
     flux_n = v[:, :-1] * h_n
 
+    # Tracer CONCENTRATION at each cell (mass / depth)
+    # For dry cells (h=0), concentration is undefined but mass is 0
+    h_safe = jnp.maximum(h, 1e-10)
+    river_conc = river_mass / h_safe
+    ocean_conc = ocean_mass / h_safe
+
+    # Upwind tracer concentrations at faces
+    river_conc_e = jnp.where(u[:-1, :] > 0, river_conc[:-1, :], river_conc[1:, :])
+    river_conc_n = jnp.where(v[:, :-1] > 0, river_conc[:, :-1], river_conc[:, 1:])
+    ocean_conc_e = jnp.where(u[:-1, :] > 0, ocean_conc[:-1, :], ocean_conc[1:, :])
+    ocean_conc_n = jnp.where(v[:, :-1] > 0, ocean_conc[:, :-1], ocean_conc[:, 1:])
+
+    # Tracer MASS flux = water flux * concentration
+    # This is the key: mass flux is coupled to water flux
+    river_flux_e = flux_e * river_conc_e
+    river_flux_n = flux_n * river_conc_n
+    ocean_flux_e = flux_e * ocean_conc_e
+    ocean_flux_n = flux_n * ocean_conc_n
+
+    # Divergence of water flux
     div = jnp.zeros_like(eta)
     div = div.at[:-1, :].add(flux_e / dx)
     div = div.at[1:, :].add(-flux_e / dx)
     div = div.at[:, :-1].add(flux_n / dy)
     div = div.at[:, 1:].add(-flux_n / dy)
 
+    # Divergence of tracer mass flux (same pattern as water)
+    div_river = jnp.zeros_like(eta)
+    div_river = div_river.at[:-1, :].add(river_flux_e / dx)
+    div_river = div_river.at[1:, :].add(-river_flux_e / dx)
+    div_river = div_river.at[:, :-1].add(river_flux_n / dy)
+    div_river = div_river.at[:, 1:].add(-river_flux_n / dy)
+
+    div_ocean = jnp.zeros_like(eta)
+    div_ocean = div_ocean.at[:-1, :].add(ocean_flux_e / dx)
+    div_ocean = div_ocean.at[1:, :].add(-ocean_flux_e / dx)
+    div_ocean = div_ocean.at[:, :-1].add(ocean_flux_n / dy)
+    div_ocean = div_ocean.at[:, 1:].add(-ocean_flux_n / dy)
+
+    # Update water level
     eta = eta - dt * div
     eta = jnp.maximum(eta, z_bed)
-
     h_new = jnp.maximum(eta - z_bed, 0.0)
 
-    river_tracer = _advect_tracer(
-        river_tracer, h, h_new, u, v, h_e, h_n, dx, dy, dt, tracer_diffusion, river_mask, 1.0
-    )
-    ocean_tracer = _advect_tracer(
-        ocean_tracer, h, h_new, u, v, h_e, h_n, dx, dy, dt, tracer_diffusion, ocean_inlet_mask, 1.0
-    )
+    # Update tracer MASS (not concentration!)
+    river_mass = river_mass - dt * div_river
+    ocean_mass = ocean_mass - dt * div_ocean
 
-    return eta, u, v, river_tracer, ocean_tracer
+    # Clip mass to physical bounds (can't be negative, can't exceed water depth)
+    river_mass = jnp.clip(river_mass, 0.0, h_new)
+    ocean_mass = jnp.clip(ocean_mass, 0.0, h_new)
+
+    # Diffusion (operates on concentration, only between wet cells)
+    wet = h_new > 0.01
+    h_new_safe = jnp.maximum(h_new, 1e-10)
+    river_conc_new = river_mass / h_new_safe
+    ocean_conc_new = ocean_mass / h_new_safe
+
+    # For diffusion, treat dry cells as having the same concentration as their wet neighbors
+    # This prevents diffusion into dry cells from diluting the tracer
+    # We use the cell's own concentration for dry neighbors
+    wet_padded = jnp.pad(wet, 1, mode="constant", constant_values=False)
+
+    river_padded = jnp.pad(river_conc_new, 1, mode="constant", constant_values=0.0)
+    ocean_padded = jnp.pad(ocean_conc_new, 1, mode="constant", constant_values=0.0)
+
+    # For each neighbor direction, use neighbor value if wet, else use center value (no flux)
+    river_north = jnp.where(wet_padded[:-2, 1:-1], river_padded[:-2, 1:-1], river_conc_new)
+    river_south = jnp.where(wet_padded[2:, 1:-1], river_padded[2:, 1:-1], river_conc_new)
+    river_west = jnp.where(wet_padded[1:-1, :-2], river_padded[1:-1, :-2], river_conc_new)
+    river_east = jnp.where(wet_padded[1:-1, 2:], river_padded[1:-1, 2:], river_conc_new)
+
+    ocean_north = jnp.where(wet_padded[:-2, 1:-1], ocean_padded[:-2, 1:-1], ocean_conc_new)
+    ocean_south = jnp.where(wet_padded[2:, 1:-1], ocean_padded[2:, 1:-1], ocean_conc_new)
+    ocean_west = jnp.where(wet_padded[1:-1, :-2], ocean_padded[1:-1, :-2], ocean_conc_new)
+    ocean_east = jnp.where(wet_padded[1:-1, 2:], ocean_padded[1:-1, 2:], ocean_conc_new)
+
+    lap_river = (river_north + river_south + river_west + river_east - 4 * river_conc_new) / (dx * dy)
+    lap_ocean = (ocean_north + ocean_south + ocean_west + ocean_east - 4 * ocean_conc_new) / (dx * dy)
+
+    river_conc_new = river_conc_new + tracer_diffusion * dt * lap_river
+    ocean_conc_new = ocean_conc_new + tracer_diffusion * dt * lap_ocean
+
+    # Clip concentrations and convert back to mass
+    river_conc_new = jnp.clip(river_conc_new, 0.0, 1.0)
+    ocean_conc_new = jnp.clip(ocean_conc_new, 0.0, 1.0)
+    river_mass = river_conc_new * h_new
+    ocean_mass = ocean_conc_new * h_new
+
+    # Zero out mass in dry cells
+    river_mass = jnp.where(wet, river_mass, 0.0)
+    ocean_mass = jnp.where(wet, ocean_mass, 0.0)
+
+    return eta, u, v, river_mass, ocean_mass
 
 
 @jit
@@ -248,8 +282,8 @@ def _apply_boundary_conditions_full(
     eta,
     u,
     v,
-    river_tracer,
-    ocean_tracer,
+    river_mass,
+    ocean_mass,
     z_bed,
     dam_mask,
     dam_level,
@@ -258,17 +292,23 @@ def _apply_boundary_conditions_full(
     river_dh,
     ocean_inlet_mask,
 ):
-    """Apply full boundary conditions including dual tracer injection."""
+    """Apply full boundary conditions including tracer mass injection.
+
+    At source boundaries, we set tracer MASS = h (i.e., concentration = 1.0).
+    This ensures water entering from sources is fully tagged.
+    """
     eta = jnp.where(dam_mask, dam_level, eta)
     eta = jnp.where(river_mask, eta + river_dh, eta)
     eta = jnp.where(river_mask, jnp.maximum(eta, river_level), eta)
 
     h = jnp.maximum(eta - z_bed, 0.0)
     wet = h > 0.01
-    river_tracer = jnp.where(river_mask & wet, 1.0, river_tracer)
-    ocean_tracer = jnp.where(ocean_inlet_mask & wet, 1.0, ocean_tracer)
 
-    return eta, u, v, river_tracer, ocean_tracer
+    # At source cells: mass = h means concentration = 1.0
+    river_mass = jnp.where(river_mask & wet, h, river_mass)
+    ocean_mass = jnp.where(ocean_inlet_mask & wet, h, ocean_mass)
+
+    return eta, u, v, river_mass, ocean_mass
 
 
 class SimulationEngine:
@@ -278,10 +318,10 @@ class SimulationEngine:
     for parallel rendering.
     """
 
-    def __init__(self, config: SimulationConfig, output_queue: Queue, log_fn=print):
+    def __init__(self, config: SimulationConfig, output_queue: Queue, log_fn=None):
         self.config = config
         self.output_queue = output_queue
-        self.log = log_fn
+        self.log = log_fn or logger.info
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
 
@@ -391,12 +431,11 @@ class SimulationEngine:
         # Ocean inlet mask - includes wall plus all domain boundaries where ocean water enters
         # This ensures any water entering from the edges gets tagged with ocean tracer
         self.ocean_inlet_mask_np = self.wall_mask_np.copy()
-        # Add east edge (last column)
-        self.ocean_inlet_mask_np[:, -1] = True
-        # Add south edge (last row)
-        self.ocean_inlet_mask_np[-1, :] = True
-        # Add north edge (first row) - but only east of the river
-        self.ocean_inlet_mask_np[0, self.config.falls_col + 10 :] = True
+        # Add all four edges of the domain
+        self.ocean_inlet_mask_np[:, -1] = True  # East edge (last column)
+        self.ocean_inlet_mask_np[:, 0] = True   # West edge (first column)
+        self.ocean_inlet_mask_np[-1, :] = True  # South edge (last row)
+        self.ocean_inlet_mask_np[0, :] = True   # North edge (first row)
 
         self.log(f"Ocean inlet: {np.sum(self.ocean_inlet_mask_np)} cells (wall + domain edges)")
         self.log(
@@ -433,8 +472,12 @@ class SimulationEngine:
         self.dt = 0.2 * min(self.config.dx, self.config.dy) / np.sqrt(self.config.g * H_max)
         self.log(f"Timestep: {self.dt:.3f}s")
 
-    def _run_simulation(self):
-        """Main simulation loop - runs in a separate thread."""
+    def _run_simulation(self, stop_at_frame: int | None = None):
+        """Main simulation loop - runs in a separate thread.
+
+        Args:
+            stop_at_frame: If set, stop after outputting this frame number (0-indexed).
+        """
         self._setup()
 
         cfg = self.config
@@ -473,15 +516,16 @@ class SimulationEngine:
         eta = jnp.array(eta_np)
         u = jnp.zeros((self.ny, self.nx))
         v = jnp.zeros((self.ny, self.nx))
-        river_tracer = jnp.zeros((self.ny, self.nx))
-        ocean_tracer = jnp.zeros((self.ny, self.nx))
+        # Track tracer MASS (= concentration * depth), not concentration
+        river_mass = jnp.zeros((self.ny, self.nx))
+        ocean_mass = jnp.zeros((self.ny, self.nx))
 
         empty_mask = jnp.zeros((self.ny, self.nx), dtype=bool)
 
         # Warm up JIT
         self.log("Warming up JIT...")
-        eta, u, v, river_tracer, ocean_tracer = _simulation_step(
-            eta, u, v, river_tracer, ocean_tracer, z_bed, manning_field, params, empty_mask, empty_mask, cfg.tracer_diffusion
+        eta, u, v, river_mass, ocean_mass = _simulation_step(
+            eta, u, v, river_mass, ocean_mass, z_bed, manning_field, params, empty_mask, empty_mask, cfg.tracer_diffusion
         )
         eta, u, v = _apply_boundary_conditions_hydro(
             eta, u, v, z_bed, wall_mask, cfg.low_tide, river_mask, cfg.low_tide + 1.0, river_dh
@@ -494,15 +538,16 @@ class SimulationEngine:
         else:
             self.log("Equilibrating at low tide...")
             for _ in range(2000):
-                eta, u, v, river_tracer, ocean_tracer = _simulation_step(
-                    eta, u, v, river_tracer, ocean_tracer, z_bed, manning_field, params, empty_mask, empty_mask, cfg.tracer_diffusion
+                eta, u, v, river_mass, ocean_mass = _simulation_step(
+                    eta, u, v, river_mass, ocean_mass, z_bed, manning_field, params, empty_mask, empty_mask, cfg.tracer_diffusion
                 )
                 eta, u, v = _apply_boundary_conditions_hydro(
                     eta, u, v, z_bed, wall_mask, cfg.low_tide, river_mask, cfg.low_tide + 1.0, river_dh
                 )
 
-        river_tracer = jnp.zeros((self.ny, self.nx))
-        ocean_tracer = jnp.zeros((self.ny, self.nx))
+        # Reset tracer mass after equilibration
+        river_mass = jnp.zeros((self.ny, self.nx))
+        ocean_mass = jnp.zeros((self.ny, self.nx))
 
         # Simulation timing
         if cfg.duration_hours is not None:
@@ -529,12 +574,12 @@ class SimulationEngine:
             else:
                 tide_level = cfg.mean_tide + cfg.tide_amplitude * np.sin(2 * np.pi * t / cfg.tide_period - np.pi / 2)
 
-            # Simulation step
-            eta, u, v, river_tracer, ocean_tracer = _simulation_step(
-                eta, u, v, river_tracer, ocean_tracer, z_bed, manning_field, params, river_mask, ocean_inlet_mask, cfg.tracer_diffusion
+            # Simulation step (using tracer mass, not concentration)
+            eta, u, v, river_mass, ocean_mass = _simulation_step(
+                eta, u, v, river_mass, ocean_mass, z_bed, manning_field, params, river_mask, ocean_inlet_mask, cfg.tracer_diffusion
             )
-            eta, u, v, river_tracer, ocean_tracer = _apply_boundary_conditions_full(
-                eta, u, v, river_tracer, ocean_tracer, z_bed, wall_mask, tide_level, river_mask, tide_level + 1.0, river_dh, ocean_inlet_mask
+            eta, u, v, river_mass, ocean_mass = _apply_boundary_conditions_full(
+                eta, u, v, river_mass, ocean_mass, z_bed, wall_mask, tide_level, river_mask, tide_level + 1.0, river_dh, ocean_inlet_mask
             )
 
             # Advect kayak
@@ -552,8 +597,17 @@ class SimulationEngine:
 
                 eta_np = np.array(eta)
                 h = np.maximum(eta_np - self.z_bed_np, 0)
-                river_tracer_np = np.array(river_tracer)
-                ocean_tracer_np = np.array(ocean_tracer)
+
+                # Convert tracer mass to concentration for output
+                # concentration = mass / depth (where depth > 0)
+                river_mass_np = np.array(river_mass)
+                ocean_mass_np = np.array(ocean_mass)
+                h_safe = np.maximum(h, 1e-10)
+                river_tracer_np = np.where(h > 0.01, river_mass_np / h_safe, 0.0)
+                ocean_tracer_np = np.where(h > 0.01, ocean_mass_np / h_safe, 0.0)
+                # Clip to valid range
+                river_tracer_np = np.clip(river_tracer_np, 0.0, 1.0)
+                ocean_tracer_np = np.clip(ocean_tracer_np, 0.0, 1.0)
 
                 wet_area_km2 = np.sum(h > 0.01) * dx * dy / 1e6
 
@@ -597,13 +651,19 @@ class SimulationEngine:
                 )
 
                 self.output_queue.put(frame_data)
-                frame_count += 1
 
                 progress = (step + 1) / n_steps * 100
                 self.log(
                     f"  {progress:5.1f}% | t={t/3600:.2f}h | tide={tide_level:+.2f}m | "
                     f"area={wet_area_km2:.2f}km² | frame {frame_count}/{n_frames}"
                 )
+
+                # Stop early if debug mode
+                if stop_at_frame is not None and frame_count >= stop_at_frame:
+                    self.log(f"\nDebug mode: stopping at frame {frame_count}")
+                    break
+
+                frame_count += 1
 
         # Signal end of stream
         self.output_queue.put(END_OF_STREAM)

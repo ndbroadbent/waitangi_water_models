@@ -1,5 +1,6 @@
 """Pipeline orchestrator - coordinates all components."""
 
+import logging
 import sys
 import time
 from queue import Queue
@@ -9,11 +10,13 @@ from waitangi.pipeline.renderer import FrameRenderer
 from waitangi.pipeline.simulation import SimulationEngine
 from waitangi.pipeline.video_writer import VideoWriter
 
-
-def _flushing_print(*args, **kwargs):
-    """Print with immediate flush for real-time progress output."""
-    print(*args, **kwargs)
-    sys.stdout.flush()
+# Configure module logger
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
 
 class Pipeline:
@@ -46,13 +49,13 @@ class Pipeline:
         frame_queue_size: int = 50,
         render_queue_size: int = 50,
         output_path: str | None = None,
-        log_fn=_flushing_print,
+        log_fn=None,
     ):
         self.sim_config = sim_config or SimulationConfig()
         self.render_config = render_config or RenderConfig()
         self.num_render_workers = num_render_workers
         self.output_path = output_path
-        self.log = log_fn
+        self.log = log_fn or logger.info
 
         # Queues for inter-component communication
         self.frame_queue: Queue = Queue(maxsize=frame_queue_size)

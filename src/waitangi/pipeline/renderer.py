@@ -5,6 +5,8 @@ for the video writer.
 """
 
 import io
+import logging
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
@@ -26,6 +28,14 @@ from waitangi.pipeline.data import (
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
+
+# Configure module logger
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
 # Use non-interactive backend for thread safety
 matplotlib.use("Agg")
@@ -80,7 +90,7 @@ class FrameRenderer:
         downsample: int,
         elevation_shape: tuple[int, int],
         num_workers: int = 4,
-        log_fn=print,
+        log_fn=None,
     ):
         self.input_queue = input_queue
         self.output_queue = output_queue
@@ -90,7 +100,7 @@ class FrameRenderer:
         self.downsample = downsample
         self.elev_shape = elevation_shape
         self.num_workers = num_workers
-        self.log = log_fn
+        self.log = log_fn or logger.info
 
         self._stop_event = threading.Event()
         self._dispatcher_thread: threading.Thread | None = None
